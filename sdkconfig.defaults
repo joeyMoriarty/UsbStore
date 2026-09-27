@@ -7,7 +7,6 @@ CONFIG_IDF_TARGET="esp32s3"
 # carry the console. Route stdio to UART0 = GPIO43 (TX) / GPIO44 (RX) and
 # watch it with an external CP2102/CH340 adapter.
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
-CONFIG_ESP_CONSOLE_UART_NUM_0=y
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 # IDF also enables a SECONDARY console on USB Serial/JTAG by default. On the S3
 # that peripheral shares the USB PHY with the OTG controller hosting the hub,
@@ -61,6 +60,12 @@ CONFIG_LWIP_MAX_SOCKETS=16
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=768
 
+# ---- Power management ----------------------------------------------------
+# Lets thermal.c drop the CPU from 160 to 80 MHz when the chip runs warm.
+# The clock is pinned (min == max) and automatic light sleep stays off, so
+# nothing changes until throttling is actually needed.
+CONFIG_PM_ENABLE=y
+
 # ---- OTA with rollback ---------------------------------------------------
 # A freshly flashed image boots on probation and is only confirmed after it
 # has run long enough to be reachable. If it panics or hangs first, the next
@@ -72,8 +77,6 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # reaches the UDP/HTTP log. Writing the dump to flash means the backtrace
 # survives the reboot and can be fetched from /api/crash afterwards.
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
-CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
-CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 CONFIG_ESP_COREDUMP_STACK_SIZE=1280
 # Keep the panic handler printing a backtrace rather than silently rebooting.
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y

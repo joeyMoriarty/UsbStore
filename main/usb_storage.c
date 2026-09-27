@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 
 #include "usb/usb_host.h"
@@ -15,25 +16,86 @@
 
 static const char *TAG = "usbstore";
 
+/* How long the less recently used of two open drives may sit idle before it
+ * is parked, freeing the channels a new plug-in needs to enumerate. */
+#define IDLE_PARK_MS  15000
+#define IDLE_CHECK_MS 2000
+
+typedef enum { ST_EMPTY = 0, ST_PARKED, ST_OPEN, ST_FAILED } slot_state_t;
+
 typedef struct {
-    bool                     present;
+    slot_state_t             st;
     uint8_t                  addr;
-    msc_host_device_handle_t dev;
-    msc_host_vfs_handle_t    vfs;
-    char                     base[12];
+    msc_host_device_handle_t dev;       /* only while OPEN */
+    msc_host_vfs_handle_t    vfs;       /* only while OPEN */
+    char                     base[12];  /* "/usbN", fixed while plugged in */
     char                     product[40];
-    uint64_t                 capacity;
+    uint64_t                 capacity;  /* learnt on first open, then kept */
+    TickType_t               last_used;
+    char                     note[48];  /* why it is FAILED */
 } slot_t;
 
 static slot_t            s_slot[USBSTORE_MAX_DRIVES];
-static SemaphoreHandle_t s_lock;          /* guards s_slot and all FS access */
+static SemaphoreHandle_t s_lock;       /* guards s_slot and all FS access */
 static QueueHandle_t     s_events;
+static slot_t           *s_active;     /* drive the current lock holder acquired */
 
 typedef struct {
-    enum { EV_CONNECT, EV_REMOVE } kind;
+    enum { EV_CONNECT, EV_REMOVE, EV_GONE_ADDR } kind;
     uint8_t                  addr;
     msc_host_device_handle_t dev;
 } ev_t;
+
+/* ---------------------------------------------------------------- helpers */
+
+/* Drives pad their names: the SanDisk 3.2Gen1 reports " SanDisk 3.2Gen1". */
+static void trim(char *s)
+{
+    size_t j = strlen(s);
+    while (j > 0 && s[j - 1] == ' ') {
+        s[--j] = '\0';
+    }
+    size_t lead = strspn(s, " ");
+    memmove(s, s + lead, j - lead + 1);
+}
+
+static int count_state(slot_state_t st)
+{
+    int n = 0;
+    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
+        n += s_slot[i].st == st;
+    }
+    return n;
+}
+
+static int count_present(void)
+{
+    return USBSTORE_MAX_DRIVES - count_state(ST_EMPTY);
+}
+
+/* How many drives may be mounted at once without starving enumeration:
+ * 2 (hub) + present + 2 x open must stay within the 8 host channels. */
+static int open_limit(void)
+{
+    return count_present() >= 3 ? 1 : 2;
+}
+
+static slot_t *slot_for_path(const char *path)
+{
+    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
+        slot_t *s = &s_slot[i];
+        if (s->st == ST_EMPTY) {
+            continue;
+        }
+        size_t n = strlen(s->base);
+        /* The mount point itself or something beneath it, so that "/usb10"
+         * cannot pass as a child of "/usb1". */
+        if (strncmp(path, s->base, n) == 0 && (path[n] == '\0' || path[n] == '/')) {
+            return s;
+        }
+    }
+    return NULL;
+}
 
 /* ---------------------------------------------------------------- locking */
 
@@ -44,161 +106,15 @@ bool usbstore_lock(uint32_t timeout_ms)
 
 void usbstore_unlock(void)
 {
+    /* The idle clock starts when the holder lets go, not when it acquired:
+     * a five-minute download is use right up to its last byte. */
+    if (s_active) {
+        if (s_active->st == ST_OPEN) {
+            s_active->last_used = xTaskGetTickCount();
+        }
+        s_active = NULL;
+    }
     xSemaphoreGive(s_lock);
-}
-
-/* ------------------------------------------------------------------ paths */
-
-bool usbstore_path_ok(const char *path)
-{
-    if (!path || path[0] != '/') {
-        return false;
-    }
-    /* Reject traversal outright rather than trying to normalise it. */
-    if (strstr(path, "..")) {
-        return false;
-    }
-
-    bool ok = false;
-    if (!usbstore_lock(500)) {
-        return false;
-    }
-    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
-        if (!s_slot[i].present) {
-            continue;
-        }
-        size_t n = strlen(s_slot[i].base);
-        /* Must be the mount point itself or something beneath it, so that
-         * "/usb10" cannot pass as a child of "/usb1". */
-        if (strncmp(path, s_slot[i].base, n) == 0 &&
-            (path[n] == '\0' || path[n] == '/')) {
-            ok = true;
-            break;
-        }
-    }
-    usbstore_unlock();
-    return ok;
-}
-
-int usbstore_list(usbstore_drive_t *out, int max)
-{
-    int n = 0;
-    if (!usbstore_lock(500)) {
-        return 0;
-    }
-    for (int i = 0; i < USBSTORE_MAX_DRIVES && n < max; i++) {
-        if (!s_slot[i].present) {
-            continue;
-        }
-        out[n].present  = true;
-        out[n].capacity = s_slot[i].capacity;
-        snprintf(out[n].base, sizeof(out[n].base), "%s", s_slot[i].base);
-        snprintf(out[n].product, sizeof(out[n].product), "%s", s_slot[i].product);
-        n++;
-    }
-    usbstore_unlock();
-    return n;
-}
-
-/* ------------------------------------------------------------- mount/umount */
-
-static void mount_device(uint8_t addr)
-{
-    if (!usbstore_lock(5000)) {
-        return;
-    }
-
-    int idx = -1;
-    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
-        if (!s_slot[i].present) {
-            idx = i;
-            break;
-        }
-    }
-    if (idx < 0) {
-        ESP_LOGW(TAG, "device %u ignored: all %d slots in use",
-                 addr, USBSTORE_MAX_DRIVES);
-        usbstore_unlock();
-        return;
-    }
-
-    slot_t *s = &s_slot[idx];
-    memset(s, 0, sizeof(*s));
-    s->addr = addr;
-
-    esp_err_t err = msc_host_install_device(addr, &s->dev);
-    if (err != ESP_OK) {
-        /* The usual cause is running out of host channels, not a bad drive. */
-        ESP_LOGE(TAG, "install_device(%u) failed: %s", addr, esp_err_to_name(err));
-        usbstore_unlock();
-        return;
-    }
-
-    msc_host_device_info_t info;
-    if (msc_host_get_device_info(s->dev, &info) == ESP_OK) {
-        s->capacity = (uint64_t)info.sector_count * (uint64_t)info.sector_size;
-        /* Product string is UTF-16; flatten the ASCII range for display. */
-        size_t j = 0;
-        for (size_t i = 0; info.iProduct[i] && j < sizeof(s->product) - 1; i++) {
-            wchar_t c = info.iProduct[i];
-            s->product[j++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
-        }
-        s->product[j] = '\0';
-
-        /* Some drives pad the name: the SanDisk 3.2Gen1 reports
-         * " SanDisk 3.2Gen1". Trim both ends. */
-        while (j > 0 && s->product[j - 1] == ' ') {
-            s->product[--j] = '\0';
-        }
-        size_t lead = strspn(s->product, " ");
-        memmove(s->product, s->product + lead, j - lead + 1);
-    }
-    if (s->product[0] == '\0') {
-        snprintf(s->product, sizeof(s->product), "USB drive");
-    }
-
-    snprintf(s->base, sizeof(s->base), "/usb%d", idx);
-
-    const esp_vfs_fat_mount_config_t mnt = {
-        .max_files            = 5,
-        /* Never true. A mount failure means an unsupported filesystem
-         * (exFAT is the common one) and formatting would erase the user's
-         * data to "fix" it. Reformat to FAT32 on a PC instead. */
-        .format_if_mount_failed = false,
-        .allocation_unit_size = 8192,
-    };
-
-    err = msc_host_vfs_register(s->dev, s->base, &mnt, &s->vfs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "mount %s failed: %s (exFAT? reformat as FAT32)",
-                 s->base, esp_err_to_name(err));
-        msc_host_uninstall_device(s->dev);
-        usbstore_unlock();
-        return;
-    }
-
-    s->present = true;
-    ESP_LOGI(TAG, "mounted %s  \"%s\"  %llu MB",
-             s->base, s->product, s->capacity / (1024ULL * 1024ULL));
-    usbstore_unlock();
-}
-
-static void unmount_device(msc_host_device_handle_t dev)
-{
-    if (!usbstore_lock(5000)) {
-        return;
-    }
-    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
-        slot_t *s = &s_slot[i];
-        if (!s->present || s->dev != dev) {
-            continue;
-        }
-        ESP_LOGI(TAG, "removing %s", s->base);
-        msc_host_vfs_unregister(s->vfs);
-        msc_host_uninstall_device(s->dev);
-        memset(s, 0, sizeof(*s));
-    }
-    usbstore_unlock();
 }
 
 /* -------------------------------------------------------------- bus census */
@@ -208,12 +124,13 @@ static void unmount_device(msc_host_device_handle_t dev)
  * S3, so a non-storage device (or one that enumerates but never mounts) is
  * still visible, and an empty list means no signal reaches the port at all.
  *
+ * It is also how a PARKED drive's removal is noticed: the MSC driver only
+ * reports disconnects for drives it has installed, while this client holds
+ * every device open and so hears every DEV_GONE.
+ *
  * Hubs themselves do NOT appear here: the host library's external hub driver
  * claims them internally and never announces them to clients. Seen on real
  * hardware - two drives behind a hub, census lists only the two drives.
- *
- * Each device is held open until it leaves, because the host library only
- * delivers DEV_GONE to clients that have the device open.
  */
 
 typedef struct {
@@ -278,6 +195,22 @@ static uint8_t effective_class(usb_device_handle_t h, uint8_t dev_class)
     return 0x00;
 }
 
+/* The product string lets a parked drive be named without mounting it. */
+static void str_desc_ascii(const usb_str_desc_t *d, char *out, size_t cap)
+{
+    out[0] = '\0';
+    if (!d || d->bLength < 2) {
+        return;
+    }
+    size_t n = (d->bLength - 2) / 2, j = 0;
+    for (size_t i = 0; i < n && j + 1 < cap; i++) {
+        uint16_t c = d->wData[i];
+        out[j++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+    out[j] = '\0';
+    trim(out);
+}
+
 static void diag_cb(const usb_host_client_event_msg_t *msg, void *arg)
 {
     if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV && s_n_new < USBSTORE_MAX_BUS) {
@@ -316,11 +249,12 @@ static void census_add(uint8_t addr)
     usb_device_info_t info;
     if (usb_host_device_info(h, &info) == ESP_OK) {
         snprintf(d.speed, sizeof(d.speed), "%s", speed_name(info.speed));
+        str_desc_ascii(info.str_desc_product, d.product, sizeof(d.product));
     }
     snprintf(d.kind, sizeof(d.kind), "%s", class_name(d.cls));
 
-    ESP_LOGI(TAG, "USB dev %u: %04x:%04x %s (class 0x%02x), %s-speed",
-             addr, d.vid, d.pid, d.kind, d.cls, d.speed);
+    ESP_LOGI(TAG, "USB dev %u: %04x:%04x %s (class 0x%02x), %s-speed \"%s\"",
+             addr, d.vid, d.pid, d.kind, d.cls, d.speed, d.product);
 
     portENTER_CRITICAL(&s_census_mux);
     for (int i = 0; i < USBSTORE_MAX_BUS; i++) {
@@ -356,6 +290,10 @@ static void census_remove(usb_device_handle_t h)
     usb_host_device_close(s_diag, h);
     if (found) {
         ESP_LOGI(TAG, "USB dev %u gone: %04x:%04x %s", gone.addr, gone.vid, gone.pid, gone.kind);
+        /* The storage layer needs this for parked drives, which the MSC
+         * driver never reports leaving. */
+        ev_t ev = { .kind = EV_GONE_ADDR, .addr = gone.addr };
+        xQueueSend(s_events, &ev, pdMS_TO_TICKS(100));
     }
 }
 
@@ -394,7 +332,397 @@ int usbstore_census(usbstore_usbdev_t *out, int max)
     return n;
 }
 
-/* ------------------------------------------------------------------ events */
+static bool census_product(uint8_t addr, char *out, size_t cap)
+{
+    bool found = false;
+    portENTER_CRITICAL(&s_census_mux);
+    for (int i = 0; i < USBSTORE_MAX_BUS; i++) {
+        if (s_census[i].used && s_census[i].info.addr == addr && s_census[i].info.product[0]) {
+            snprintf(out, cap, "%s", s_census[i].info.product);
+            found = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_census_mux);
+    return found;
+}
+
+/*
+ * Reset the drive's bulk data toggles before the MSC driver claims it again.
+ *
+ * Every bulk packet carries an alternating DATA0/DATA1 bit. Parking frees the
+ * host's pipes, but the drive keeps its own toggle state; a re-claimed pipe
+ * starts at DATA0, the drive expects whatever came next, and it silently
+ * drops the first command as a duplicate. The symptom on real hardware: a
+ * drive opens fine once, then every re-open times out ("Transfer failed:
+ * Status 3") on its very first SCSI command.
+ *
+ * CLEAR_FEATURE(ENDPOINT_HALT) resets the device-side toggle to DATA0 even
+ * when the endpoint is not halted (USB 2.0 §9.4.5) - exactly what a fresh
+ * host pipe expects. Sent from the census client, which holds every device
+ * open anyway, so no MSC state is involved.
+ */
+static SemaphoreHandle_t s_ctrl_done;
+
+static void ctrl_cb(usb_transfer_t *xfer)
+{
+    xSemaphoreGive((SemaphoreHandle_t)xfer->context);
+}
+
+static esp_err_t census_reset_toggles(uint8_t addr)
+{
+    usb_device_handle_t h = NULL;
+    portENTER_CRITICAL(&s_census_mux);
+    for (int i = 0; i < USBSTORE_MAX_BUS; i++) {
+        if (s_census[i].used && s_census[i].info.addr == addr) {
+            h = s_census[i].h;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_census_mux);
+    if (!h) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /* The bulk endpoints of the mass-storage interface. */
+    const usb_config_desc_t *cfg = NULL;
+    if (usb_host_get_active_config_descriptor(h, &cfg) != ESP_OK || !cfg) {
+        return ESP_FAIL;
+    }
+    uint8_t eps[2] = {0};
+    int     n_eps  = 0;
+    bool    in_msc = false;
+    const uint8_t *p = (const uint8_t *)cfg;
+    for (uint16_t i = 0; i + 1 < cfg->wTotalLength && p[i] >= 2; i += p[i]) {
+        if (p[i + 1] == 0x04 && i + 5 < cfg->wTotalLength) {        /* INTERFACE */
+            in_msc = p[i + 5] == 0x08;
+        } else if (in_msc && p[i + 1] == 0x05 && i + 3 < cfg->wTotalLength &&
+                   (p[i + 3] & 0x03) == 0x02 && n_eps < 2) {         /* bulk ENDPOINT */
+            eps[n_eps++] = p[i + 2];
+        }
+    }
+    if (n_eps == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    usb_transfer_t *x = NULL;
+    if (usb_host_transfer_alloc(sizeof(usb_setup_packet_t), 0, &x) != ESP_OK) {
+        return ESP_ERR_NO_MEM;
+    }
+    x->device_handle    = h;
+    x->bEndpointAddress = 0;
+    x->callback         = ctrl_cb;
+    x->context          = s_ctrl_done;
+    x->num_bytes        = sizeof(usb_setup_packet_t);
+
+    esp_err_t err = ESP_OK;
+    for (int i = 0; i < n_eps && err == ESP_OK; i++) {
+        usb_setup_packet_t *sp = (usb_setup_packet_t *)x->data_buffer;
+        sp->bmRequestType = USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_STANDARD |
+                            USB_BM_REQUEST_TYPE_RECIP_ENDPOINT;
+        sp->bRequest = USB_B_REQUEST_CLEAR_FEATURE;
+        sp->wValue   = 0;                     /* ENDPOINT_HALT */
+        sp->wIndex   = eps[i];
+        sp->wLength  = 0;
+
+        err = usb_host_transfer_submit_control(s_diag, x);
+        if (err != ESP_OK) {
+            break;
+        }
+        /* The census task pumps this client's events, so the callback runs
+         * there while this task waits. */
+        if (xSemaphoreTake(s_ctrl_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            /* Still in flight: freeing it now would be a use-after-free.
+             * Leak one small transfer rather than risk that. */
+            ESP_LOGW(TAG, "dev %u: toggle reset timed out", addr);
+            return ESP_ERR_TIMEOUT;
+        }
+        if (x->status != USB_TRANSFER_STATUS_COMPLETED) {
+            err = ESP_FAIL;
+        }
+    }
+    usb_host_transfer_free(x);
+    return err;
+}
+
+/* ------------------------------------------------------------ open / park */
+/* All of these run with s_lock held. */
+
+static esp_err_t slot_open(slot_t *s)
+{
+    /* Always, not just after a park: harmless on a fresh drive, and it also
+     * rescues one parked by a build that didn't reset on the way out. */
+    esp_err_t tr = census_reset_toggles(s->addr);
+    if (tr != ESP_OK) {
+        ESP_LOGW(TAG, "%s: toggle reset skipped (%s)", s->base, esp_err_to_name(tr));
+    }
+
+    esp_err_t err = msc_host_install_device(s->addr, &s->dev);
+    if (err != ESP_OK) {
+        /* Stays PARKED rather than FAILED: running out of host channels
+         * lands here too, and that clears once another drive is parked. */
+        s->dev = NULL;
+        snprintf(s->note, sizeof(s->note), "could not open (%s)", esp_err_to_name(err));
+        ESP_LOGE(TAG, "%s: %s", s->base, s->note);
+        return err;
+    }
+
+    msc_host_device_info_t info;
+    if (msc_host_get_device_info(s->dev, &info) == ESP_OK) {
+        s->capacity = (uint64_t)info.sector_count * (uint64_t)info.sector_size;
+        if (!s->product[0]) {
+            size_t j = 0;
+            for (size_t i = 0; info.iProduct[i] && j < sizeof(s->product) - 1; i++) {
+                wchar_t c = info.iProduct[i];
+                s->product[j++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+            }
+            s->product[j] = '\0';
+            trim(s->product);
+        }
+    }
+
+    const esp_vfs_fat_mount_config_t mnt = {
+        .max_files            = 5,
+        /* Never true. A mount failure means an unsupported filesystem
+         * (exFAT is the common one) and formatting would erase the user's
+         * data to "fix" it. Reformat to FAT32 on a PC instead. */
+        .format_if_mount_failed = false,
+        .allocation_unit_size = 8192,
+    };
+    err = msc_host_vfs_register(s->dev, s->base, &mnt, &s->vfs);
+    if (err != ESP_OK) {
+        msc_host_uninstall_device(s->dev);
+        s->dev = NULL;
+        s->st  = ST_FAILED;
+        snprintf(s->note, sizeof(s->note), "not FAT32 - reformat on a PC");
+        ESP_LOGE(TAG, "mount %s failed: %s (exFAT? reformat as FAT32)",
+                 s->base, esp_err_to_name(err));
+        return err;
+    }
+
+    s->st        = ST_OPEN;
+    s->note[0]   = '\0';
+    s->last_used = xTaskGetTickCount();
+    ESP_LOGI(TAG, "opened %s  \"%s\"  %llu MB", s->base, s->product,
+             s->capacity / (1024ULL * 1024ULL));
+    return ESP_OK;
+}
+
+/*
+ * Deliberately NOT msc_host_reset_recovery() here, although it looks like the
+ * right tool. It is only safe on a drive whose endpoints are actually stalled:
+ * its clear_feature() halts the host pipe, then returns early without
+ * un-halting it when the endpoint has no STALL to flush (msc_host.c, usb_host_
+ * msc 1.3.0). On a healthy drive it leaves both pipes frozen and its closing
+ * readiness check times out twice - measured as ~10 s added to every swap.
+ * The toggle reset that matters happens on the way back in, in slot_open().
+ */
+static void slot_park(slot_t *s)
+{
+    msc_host_vfs_unregister(s->vfs);     /* flushes FAT before letting go */
+    msc_host_uninstall_device(s->dev);
+    s->vfs = NULL;
+    s->dev = NULL;
+    s->st  = ST_PARKED;
+    ESP_LOGI(TAG, "parked %s  \"%s\"", s->base, s->product);
+}
+
+/* The open drive used longest ago, other than `keep`. */
+static slot_t *lru_open(const slot_t *keep)
+{
+    slot_t *best = NULL;
+    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
+        slot_t *s = &s_slot[i];
+        if (s == keep || s->st != ST_OPEN) {
+            continue;
+        }
+        if (!best || (TickType_t)(s->last_used - best->last_used) > portMAX_DELAY / 2) {
+            best = s;      /* wrap-safe "s is older than best" */
+        }
+    }
+    return best;
+}
+
+esp_err_t usbstore_acquire(const char *path, char *why, size_t why_len)
+{
+    slot_t *s = slot_for_path(path);
+    if (!s) {
+        snprintf(why, why_len, "drive not present");
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (s->st == ST_FAILED) {
+        snprintf(why, why_len, "%s", s->note);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_active = s;
+    if (s->st == ST_OPEN) {
+        return ESP_OK;
+    }
+
+    /* Parked: make room within the channel budget, then swap it in. Safe to
+     * park others here - the caller holds the lock, so none has a transfer
+     * in flight. */
+    while (count_state(ST_OPEN) >= open_limit()) {
+        slot_t *victim = lru_open(s);
+        if (!victim) {
+            break;
+        }
+        slot_park(victim);
+    }
+
+    esp_err_t err = slot_open(s);
+    if (err != ESP_OK) {
+        snprintf(why, why_len, "%s", s->note[0] ? s->note : "could not open drive");
+    }
+    return err;
+}
+
+int usbstore_park_all(uint32_t timeout_ms)
+{
+    if (!usbstore_lock(timeout_ms)) {
+        return -1;
+    }
+    int n = 0;
+    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
+        if (s_slot[i].st == ST_OPEN) {
+            slot_park(&s_slot[i]);
+            n++;
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return n;
+}
+
+/* ------------------------------------------------------------- queries */
+
+bool usbstore_path_ok(const char *path)
+{
+    if (!path || path[0] != '/') {
+        return false;
+    }
+    /* Reject traversal outright rather than trying to normalise it. */
+    if (strstr(path, "..")) {
+        return false;
+    }
+    if (!usbstore_lock(500)) {
+        return false;
+    }
+    bool ok = slot_for_path(path) != NULL;
+    xSemaphoreGive(s_lock);     /* plain give: a lookup is not "use" */
+    return ok;
+}
+
+int usbstore_list(usbstore_drive_t *out, int max)
+{
+    int n = 0;
+    if (!usbstore_lock(500)) {
+        return 0;
+    }
+    for (int i = 0; i < USBSTORE_MAX_DRIVES && n < max; i++) {
+        const slot_t *s = &s_slot[i];
+        if (s->st == ST_EMPTY) {
+            continue;
+        }
+        usbstore_drive_t *d = &out[n++];
+        memset(d, 0, sizeof(*d));
+        d->present  = true;
+        d->capacity = s->capacity;
+        snprintf(d->base, sizeof(d->base), "%s", s->base);
+        snprintf(d->state, sizeof(d->state), "%s",
+                 s->st == ST_OPEN ? "open" : s->st == ST_FAILED ? "failed" : "parked");
+        snprintf(d->note, sizeof(d->note), "%s", s->st == ST_FAILED ? s->note : "");
+        if (s->product[0]) {
+            snprintf(d->product, sizeof(d->product), "%s", s->product);
+        } else if (!census_product(s->addr, d->product, sizeof(d->product))) {
+            snprintf(d->product, sizeof(d->product), "USB drive");
+        }
+    }
+    xSemaphoreGive(s_lock);
+    return n;
+}
+
+/* ------------------------------------------------------------- lifecycle */
+
+static void on_connect(uint8_t addr)
+{
+    if (!usbstore_lock(10000)) {
+        ESP_LOGE(TAG, "drive %u: storage busy, not added", addr);
+        return;
+    }
+
+    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
+        if (s_slot[i].st != ST_EMPTY && s_slot[i].addr == addr) {
+            xSemaphoreGive(s_lock);         /* duplicate event */
+            return;
+        }
+    }
+
+    int idx = -1;
+    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
+        if (s_slot[i].st == ST_EMPTY) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        ESP_LOGW(TAG, "drive %u ignored: all %d slots in use", addr, USBSTORE_MAX_DRIVES);
+        xSemaphoreGive(s_lock);
+        return;
+    }
+
+    slot_t *s = &s_slot[idx];
+    memset(s, 0, sizeof(*s));
+    s->st   = ST_PARKED;
+    s->addr = addr;
+    snprintf(s->base, sizeof(s->base), "/usb%d", idx);
+    census_product(addr, s->product, sizeof(s->product));
+    ESP_LOGI(TAG, "drive on %s  \"%s\"  (%d present)", s->base, s->product, count_present());
+
+    /* Open it straight away only if nothing else is open. Opening a second
+     * drive here would fill all 8 channels and stop the next plug-in from
+     * enumerating; it opens on first use instead. */
+    if (count_state(ST_OPEN) == 0) {
+        slot_open(s);
+    }
+    xSemaphoreGive(s_lock);
+}
+
+/* An installed (OPEN) drive left: the MSC driver reported it. */
+static void on_msc_removed(msc_host_device_handle_t dev)
+{
+    if (!usbstore_lock(10000)) {
+        return;
+    }
+    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
+        slot_t *s = &s_slot[i];
+        if (s->st == ST_OPEN && s->dev == dev) {
+            ESP_LOGI(TAG, "removed %s  \"%s\"", s->base, s->product);
+            msc_host_vfs_unregister(s->vfs);
+            msc_host_uninstall_device(s->dev);
+            memset(s, 0, sizeof(*s));
+        }
+    }
+    xSemaphoreGive(s_lock);
+}
+
+/* Any device left, per the census. Only acts on drives the MSC driver was
+ * not tracking - OPEN ones are cleaned up by on_msc_removed(). */
+static void on_gone_addr(uint8_t addr)
+{
+    if (!usbstore_lock(10000)) {
+        return;
+    }
+    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
+        slot_t *s = &s_slot[i];
+        if ((s->st == ST_PARKED || s->st == ST_FAILED) && s->addr == addr) {
+            ESP_LOGI(TAG, "removed %s  \"%s\"  (was %s)", s->base, s->product,
+                     s->st == ST_PARKED ? "parked" : "failed");
+            memset(s, 0, sizeof(*s));
+        }
+    }
+    xSemaphoreGive(s_lock);
+}
 
 /* Runs in the MSC driver's task: post to a queue, do the slow work elsewhere. */
 static void msc_cb(const msc_host_event_t *event, void *arg)
@@ -419,11 +747,41 @@ static void worker_task(void *arg)
         if (xQueueReceive(s_events, &ev, portMAX_DELAY) != pdTRUE) {
             continue;
         }
-        if (ev.kind == EV_CONNECT) {
-            mount_device(ev.addr);
-        } else {
-            unmount_device(ev.dev);
+        switch (ev.kind) {
+        case EV_CONNECT:   on_connect(ev.addr);     break;
+        case EV_REMOVE:    on_msc_removed(ev.dev);  break;
+        case EV_GONE_ADDR: on_gone_addr(ev.addr);   break;
         }
+    }
+}
+
+/*
+ * Parks the less recently used of two open drives once it has been idle for
+ * IDLE_PARK_MS, and enforces the one-open rule if a third drive turned up.
+ * A lock it cannot get immediately means a transfer is running - by
+ * definition not idle - so it just tries again next round.
+ */
+static void idle_task(void *arg)
+{
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(IDLE_CHECK_MS));
+        if (!usbstore_lock(50)) {
+            continue;
+        }
+        while (count_state(ST_OPEN) > open_limit()) {
+            slot_t *victim = lru_open(NULL);
+            if (!victim) {
+                break;
+            }
+            slot_park(victim);
+        }
+        if (count_state(ST_OPEN) > 1) {
+            slot_t *victim = lru_open(NULL);
+            if (victim && xTaskGetTickCount() - victim->last_used > pdMS_TO_TICKS(IDLE_PARK_MS)) {
+                slot_park(victim);
+            }
+        }
+        xSemaphoreGive(s_lock);
     }
 }
 
@@ -447,8 +805,12 @@ esp_err_t usbstore_start(void)
     if (!s_lock) {
         return ESP_ERR_NO_MEM;
     }
-    s_events = xQueueCreate(8, sizeof(ev_t));
+    s_events = xQueueCreate(16, sizeof(ev_t));
     if (!s_events) {
+        return ESP_ERR_NO_MEM;
+    }
+    s_ctrl_done = xSemaphoreCreateBinary();
+    if (!s_ctrl_done) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -498,7 +860,11 @@ esp_err_t usbstore_start(void)
     if (xTaskCreate(worker_task, "usb_mount", 5120, NULL, 3, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
+    if (xTaskCreate(idle_task, "usb_idle", 4096, NULL, 2, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
 
-    ESP_LOGI(TAG, "USB host up, waiting for drives (hub support compiled in)");
+    ESP_LOGI(TAG, "USB host up, waiting for drives (park-and-swap: max %d)",
+             USBSTORE_MAX_DRIVES);
     return ESP_OK;
 }

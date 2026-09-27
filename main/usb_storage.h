@@ -3,9 +3,25 @@
  * on its own VFS path (/usb0, /usb1, ...).
  *
  * Throughput ceiling is the bus, not this code. The ESP32-S3's USB is Full
- * Speed only (USB 1.1, 12 Mbit/s); Espressif measure ~540 KB/s read and
- * ~350 KB/s write, and that is shared across every drive on the hub. Treat
- * this as a document and photo drop, not a media server.
+ * Speed only (USB 1.1, 12 Mbit/s): measured ~520 KB/s read over WiFi, shared
+ * across every drive on the hub. A document and photo drop, not a media server.
+ *
+ * ---- Park and swap -------------------------------------------------------
+ * The S3 has 8 USB host channels and every open pipe holds one permanently:
+ * the hub 2, each drive's control pipe 1, and each *mounted* drive another 2
+ * (bulk in + out). Two mounted drives behind a hub use all 8, and a third
+ * cannot even enumerate.
+ *
+ * So a drive can be recognised without being mounted. States:
+ *   PARKED - enumerated, control pipe only (1 channel), not mounted
+ *   OPEN   - MSC installed + FAT mounted (3 channels)
+ *   FAILED - could not be mounted (unsupported filesystem, etc.)
+ *
+ * Budget: 2 (hub) + drives + 2 x open <= 8. With 1-2 drives present, both
+ * may be open; with 3-4, one at a time, and touching a parked drive swaps it
+ * in. At plug-in a drive is opened only if nothing else is open, and when two
+ * are open the less recently used one is parked after a short idle period -
+ * which keeps a channel free so the NEXT plug-in can enumerate.
  */
 
 #pragma once
@@ -14,14 +30,16 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-/* Bounded by the S3's 8 host channels once the hub takes its share. */
+/* Bounded by the channel budget above: 2 + 4 + 2 = 8 with one open. */
 #define USBSTORE_MAX_DRIVES 4
 
 typedef struct {
     bool     present;
-    char     base[12];     /* VFS mount point, e.g. "/usb0" */
+    char     base[12];     /* VFS mount point, e.g. "/usb0" - stable while plugged in */
     char     product[40];  /* USB product string, best effort */
-    uint64_t capacity;     /* bytes, 0 if unknown */
+    uint64_t capacity;     /* bytes; 0 until the drive has been opened once */
+    char     state[8];     /* "open", "parked" or "failed" */
+    char     note[48];     /* why it failed, when state is "failed" */
 } usbstore_drive_t;
 
 /* Every enumerated device, not just drives - except hubs, which the host
@@ -32,9 +50,10 @@ typedef struct {
     uint8_t  addr;
     uint16_t vid;
     uint16_t pid;
-    uint8_t  cls;        /* device class, or first interface class if 0 */
-    char     kind[16];   /* "hub", "mass-storage", ... */
-    char     speed[6];   /* "low" / "full" / "high" */
+    uint8_t  cls;          /* device class, or first interface class if 0 */
+    char     kind[16];     /* "hub", "mass-storage", ... */
+    char     speed[6];     /* "low" / "full" / "high" */
+    char     product[40];  /* from the string descriptor, if the device has one */
 } usbstore_usbdev_t;
 
 esp_err_t usbstore_start(void);
@@ -43,14 +62,31 @@ esp_err_t usbstore_start(void);
  * the S3's port at all - a cable, adapter or power problem, not a drive one. */
 int usbstore_census(usbstore_usbdev_t *out, int max);
 
-/* Snapshot of the mount table. Returns the number of entries filled. */
+/* Snapshot of the drive table, open and parked alike. */
 int usbstore_list(usbstore_drive_t *out, int max);
 
-/* True if path sits inside a currently mounted drive and contains no "..".
- * Every filesystem call from the web layer must pass this first. */
+/* True if path sits inside a known drive (open or parked) and contains no
+ * "..". Every filesystem call from the web layer must pass this first. */
 bool usbstore_path_ok(const char *path);
 
 /* FATFS and the MSC driver are not reentrant, and a drive can be yanked
  * mid-read. Every filesystem access is wrapped in this lock. */
 bool usbstore_lock(uint32_t timeout_ms);
 void usbstore_unlock(void);
+
+/*
+ * Make sure the drive holding `path` is mounted, parking another if the
+ * channel budget requires it. Call with usbstore_lock() HELD, before touching
+ * the filesystem: holding the lock is what guarantees the drive being parked
+ * has no transfer in flight. On failure a human-readable reason is copied
+ * into `why`.
+ *
+ * The drive's idle clock restarts when the lock is released, so a long
+ * download counts as use right up to its last byte.
+ */
+esp_err_t usbstore_acquire(const char *path, char *why, size_t why_len);
+
+/* Unmount every open drive (flushing FAT) so the box can sleep or power off
+ * without leaving a filesystem half-written. Waits up to timeout_ms for an
+ * in-flight transfer to finish. Returns drives parked, or -1 if it timed out. */
+int usbstore_park_all(uint32_t timeout_ms);

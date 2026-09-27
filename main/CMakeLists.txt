@@ -7,6 +7,7 @@ idf_component_register(
         "netlog.c"
         "auth.c"
         "ota.c"
+        "thermal.c"
     INCLUDE_DIRS "."
     EMBED_FILES "www/index.html"
 )

@@ -9,6 +9,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "mdns.h"
@@ -23,17 +24,48 @@ static const char *NVS_NS = "wifi";
 #define GAVE_UP  BIT1
 #define MAX_TRY  5
 
-static EventGroupHandle_t s_events;
-static bool  s_station;
-static char  s_ip[16] = "0.0.0.0";
-static char  s_ssid[33];
-static int   s_tries;
+#define BACKOFF_MIN_S 2
+#define BACKOFF_MAX_S 30
+
+static EventGroupHandle_t  s_events;
+static bool                s_station;
+static char                s_ip[16] = "0.0.0.0";
+static char                s_ssid[33];
+static int                 s_tries;
+static esp_timer_handle_t  s_retry;
+static int                 s_backoff_s = BACKOFF_MIN_S;
+static volatile bool       s_paused;    /* WiFi deliberately off (cool-down) */
+
+static void retry_cb(void *arg)
+{
+    if (!s_paused) {
+        esp_wifi_connect();
+    }
+}
 
 static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        if (!s_paused) {
+            esp_wifi_connect();
+        }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_paused) {
+            return;
+        }
+        if (s_station) {
+            /* Joined once already, so the credentials are right - the network
+             * just went away (router reboot, signal). Retry forever with a
+             * growing delay; giving up here would leave the box offline until
+             * someone power-cycles it. The event handler must not block, so
+             * the wait lives in a one-shot timer. */
+            ESP_LOGW(TAG, "lost \"%s\", reconnecting in %d s", s_ssid, s_backoff_s);
+            esp_timer_start_once(s_retry, (uint64_t)s_backoff_s * 1000000ULL);
+            s_backoff_s = s_backoff_s * 2 > BACKOFF_MAX_S ? BACKOFF_MAX_S : s_backoff_s * 2;
+            return;
+        }
+        /* First boot: a few quick tries, then fall back to the setup AP -
+         * the credentials themselves may be wrong. */
         if (++s_tries <= MAX_TRY) {
             ESP_LOGW(TAG, "retry %d/%d", s_tries, MAX_TRY);
             esp_wifi_connect();
@@ -43,7 +75,11 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&e->ip_info.ip));
-        s_tries = 0;
+        if (s_station) {
+            ESP_LOGI(TAG, "reconnected as %s", s_ip);
+        }
+        s_tries     = 0;
+        s_backoff_s = BACKOFF_MIN_S;
         xEventGroupSetBits(s_events, GOT_IP);
     }
 }
@@ -107,6 +143,8 @@ static void start_setup_ap(void)
 esp_err_t wifi_mgr_start(void)
 {
     s_events = xEventGroupCreate();
+    const esp_timer_create_args_t targs = { .callback = retry_cb, .name = "wifi_retry" };
+    ESP_ERROR_CHECK(esp_timer_create(&targs, &s_retry));
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -167,6 +205,21 @@ esp_err_t wifi_mgr_start(void)
 bool wifi_mgr_is_station(void)
 {
     return s_station;
+}
+
+void wifi_mgr_pause(void)
+{
+    s_paused = true;
+    esp_timer_stop(s_retry);
+    esp_wifi_stop();
+}
+
+void wifi_mgr_power_save(bool on)
+{
+    /* MAX_MODEM sleeps the radio between beacons: slower to respond, but a
+     * real cut in radio-on time - which is the main heat source. MIN_MODEM
+     * is ESP-IDF's default. No effect in setup-AP mode. */
+    esp_wifi_set_ps(on ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM);
 }
 
 void wifi_mgr_status(char *out, size_t len)

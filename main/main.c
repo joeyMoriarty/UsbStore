@@ -21,6 +21,7 @@
 #include "netlog.h"
 #include "auth.h"
 #include "ota.h"
+#include "thermal.h"
 
 static const char *TAG = "main";
 
@@ -59,6 +60,12 @@ void app_main(void)
 
     ESP_ERROR_CHECK(web_server_start());
 
+    /* Last: its cool-down path uses every subsystem above. A dead sensor is
+     * not fatal - the box just runs without thermal protection. */
+    if (thermal_start() != ESP_OK) {
+        ESP_LOGE(TAG, "thermal monitor failed to start");
+    }
+
     char status[96];
     wifi_mgr_status(status, sizeof(status));
     ESP_LOGI(TAG, "ready: %s", status);
@@ -80,14 +87,15 @@ void app_main(void)
         int n = usbstore_list(d, USBSTORE_MAX_DRIVES);
         usbstore_usbdev_t u[USBSTORE_MAX_BUS];
         int nu = usbstore_census(u, USBSTORE_MAX_BUS);
-        ESP_LOGI(TAG, "%d USB device(s) on bus, %d drive(s) mounted, heap %u",
-                 nu, n, (unsigned)esp_get_free_heap_size());
+        ESP_LOGI(TAG, "%d USB device(s) on bus, %d drive(s), heap %u, chip %.1f C (%s)",
+                 nu, n, (unsigned)esp_get_free_heap_size(),
+                 thermal_celsius(), thermal_state_name());
         if (nu == 0) {
             ESP_LOGW(TAG, "nothing on the USB bus: no hub/drive signal is reaching the S3");
         }
         for (int i = 0; i < n; i++) {
-            ESP_LOGI(TAG, "  %s  \"%s\"  %llu MB",
-                     d[i].base, d[i].product,
+            ESP_LOGI(TAG, "  %s  %-6s  \"%s\"  %llu MB",
+                     d[i].base, d[i].state, d[i].product,
                      d[i].capacity / (1024ULL * 1024ULL));
         }
     }

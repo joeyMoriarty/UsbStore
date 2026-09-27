@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/unistd.h>
@@ -23,6 +24,7 @@
 #include "netlog.h"
 #include "auth.h"
 #include "ota.h"
+#include "thermal.h"
 
 static const char *TAG = "web";
 
@@ -223,6 +225,27 @@ static const char *mime_for(const char *name)
     return "application/octet-stream";
 }
 
+/*
+ * Lock the filesystem and make sure the drive holding `path` is mounted. With
+ * park-and-swap a parked drive is swapped in here, so this is where a browser
+ * waits ~1 s the first time it touches one. On failure the error response has
+ * already been sent and the lock is NOT held.
+ */
+static bool lock_drive(httpd_req_t *r, const char *path, uint32_t timeout_ms)
+{
+    if (!usbstore_lock(timeout_ms)) {
+        fail(r, 503, "filesystem busy");
+        return false;
+    }
+    char why[64];
+    if (usbstore_acquire(path, why, sizeof(why)) != ESP_OK) {
+        usbstore_unlock();
+        fail(r, 503, why);
+        return false;
+    }
+    return true;
+}
+
 /* ---------------------------------------------------------------- routes */
 
 /* Browsers ask for this on every load; answer quietly instead of logging a
@@ -255,23 +278,47 @@ static esp_err_t h_status(httpd_req_t *r)
     char ver[48];
     json_esc(ver, sizeof(ver), ota_running_version());
 
+    /* NAN (no reading yet, or no sensor) goes out as JSON null. */
+    char t_now[12], t_peak[12], cool[160] = "null";
+    float tn = thermal_celsius(), tp = thermal_peak_celsius();
+    if (isnan(tn)) snprintf(t_now, sizeof(t_now), "null");
+    else           snprintf(t_now, sizeof(t_now), "%.1f", tn);
+    if (isnan(tp)) snprintf(t_peak, sizeof(t_peak), "null");
+    else           snprintf(t_peak, sizeof(t_peak), "%.1f", tp);
+    therm_cooldown_t cd = thermal_last_cooldown();
+    if (cd.valid) {
+        snprintf(cool, sizeof(cool),
+                 "{\"test\":%s,\"peak_c\":%.1f,\"end_c\":%.1f,\"slept_s\":%lu}",
+                 cd.was_test ? "true" : "false", cd.peak_c, cd.end_c,
+                 (unsigned long)cd.slept_s);
+    }
+
     int o = snprintf(s_buf, XFER_SZ,
                      "{\"wifi\":\"%s\",\"provisioned\":%s,\"auth\":%s,"
-                     "\"version\":\"%s\",\"heap\":%u,\"uptime_s\":%lld,\"drives\":[",
+                     "\"version\":\"%s\",\"heap\":%u,\"uptime_s\":%lld,"
+                     "\"temp_c\":%s,\"temp_peak_c\":%s,\"thermal\":\"%s\","
+                     "\"therm_warm_c\":%.0f,\"therm_hot_c\":%.0f,\"cooldown\":%s,"
+                     "\"drives\":[",
                      wifi_esc,
                      wifi_mgr_is_station() ? "true" : "false",
                      auth_is_set() ? "true" : "false",
                      ver,
                      (unsigned)esp_get_free_heap_size(),
-                     (long long)(esp_timer_get_time() / 1000000));
+                     (long long)(esp_timer_get_time() / 1000000),
+                     t_now, t_peak, thermal_state_name(),
+                     THERM_WARM_C, THERM_HOT_C, cool);
 
-    for (int i = 0; i < n && o < XFER_SZ - 160; i++) {
-        char name[96];
+    /* 512 of headroom: one entry with an escaped name and note is ~350
+     * bytes, and a truncated snprintf would push `o` past the buffer. */
+    for (int i = 0; i < n && o < XFER_SZ - 512; i++) {
+        char name[96], note[112];
         json_esc(name, sizeof(name), d[i].product);
+        json_esc(note, sizeof(note), d[i].note);
         o += snprintf(s_buf + o, XFER_SZ - o,
-                      "%s{\"path\":\"%s\",\"name\":\"%s\",\"bytes\":%llu}",
+                      "%s{\"path\":\"%s\",\"name\":\"%s\",\"bytes\":%llu,"
+                      "\"state\":\"%s\",\"note\":\"%s\"}",
                       i ? "," : "", d[i].base, name,
-                      (unsigned long long)d[i].capacity);
+                      (unsigned long long)d[i].capacity, d[i].state, note);
     }
     /* Everything on the bus, hub included: the diagnostic view. */
     usbstore_usbdev_t u[USBSTORE_MAX_BUS];
@@ -302,8 +349,8 @@ static esp_err_t h_list(httpd_req_t *r)
     if (!usbstore_path_ok(path)) {
         return fail(r, 403, "path outside a mounted drive");
     }
-    if (!usbstore_lock(5000)) {
-        return fail(r, 503, "filesystem busy");
+    if (!lock_drive(r, path, 5000)) {
+        return ESP_OK;
     }
 
     DIR *dir = opendir(path);
@@ -373,8 +420,8 @@ static esp_err_t h_download(httpd_req_t *r)
     if (!usbstore_path_ok(path)) {
         return fail(r, 403, "path outside a mounted drive");
     }
-    if (!usbstore_lock(5000)) {
-        return fail(r, 503, "filesystem busy");
+    if (!lock_drive(r, path, 5000)) {
+        return ESP_OK;
     }
 
     FILE *f = fopen(path, "rb");
@@ -411,6 +458,12 @@ static esp_err_t h_download(httpd_req_t *r)
     esp_err_t err = ESP_OK;
     size_t got;
     while ((got = fread(s_buf, 1, XFER_SZ, f)) > 0) {
+        /* An overheat cool-down needs this drive unmounted; stop within a
+         * chunk rather than make it wait out a long download. */
+        if (thermal_cooling()) {
+            err = ESP_FAIL;
+            break;
+        }
         if (httpd_resp_send_chunk(r, s_buf, got) != ESP_OK) {
             /* Browser cancelled, or the drive vanished mid-read. */
             err = ESP_FAIL;
@@ -441,8 +494,9 @@ static esp_err_t h_upload(httpd_req_t *r)
     if (!usbstore_path_ok(path)) {
         return fail(r, 403, "path outside a mounted drive");
     }
-    if (!usbstore_lock(10000)) {
-        return fail(r, 503, "filesystem busy");
+    /* ESP_FAIL on refusal, as for auth: close rather than drain the body. */
+    if (!lock_drive(r, path, 10000)) {
+        return ESP_FAIL;
     }
 
     /* Raw body, not multipart: the browser sends the bytes as-is so the
@@ -456,6 +510,10 @@ static esp_err_t h_upload(httpd_req_t *r)
     int  left = r->content_len;
     bool ok   = true;
     while (left > 0) {
+        if (thermal_cooling()) {
+            ok = false;          /* partial file is deleted below, as for any failure */
+            break;
+        }
         int want = left < XFER_SZ ? left : XFER_SZ;
         int got  = httpd_req_recv(r, s_buf, want);
         if (got == HTTPD_SOCK_ERR_TIMEOUT) {
@@ -498,8 +556,8 @@ static esp_err_t h_delete(httpd_req_t *r)
     if (!usbstore_path_ok(path)) {
         return fail(r, 403, "path outside a mounted drive");
     }
-    if (!usbstore_lock(5000)) {
-        return fail(r, 503, "filesystem busy");
+    if (!lock_drive(r, path, 5000)) {
+        return ESP_OK;
     }
 
     struct stat st;
@@ -530,8 +588,8 @@ static esp_err_t h_mkdir(httpd_req_t *r)
     if (!usbstore_path_ok(path)) {
         return fail(r, 403, "path outside a mounted drive");
     }
-    if (!usbstore_lock(5000)) {
-        return fail(r, 503, "filesystem busy");
+    if (!lock_drive(r, path, 5000)) {
+        return ESP_OK;
     }
     int rc = mkdir(path, 0775);
     usbstore_unlock();
@@ -668,6 +726,23 @@ static esp_err_t h_auth_probe(httpd_req_t *r)
     return ok_json(r);
 }
 
+/*
+ * Run the overheat cool-down now, for 30 s, regardless of temperature - the
+ * only practical way to prove the sleep-and-reboot path works on real
+ * hardware. Protected: it takes the box offline for about a minute.
+ */
+static esp_err_t h_thermal_test(httpd_req_t *r)
+{
+    if (!auth_check(r)) {
+        return ESP_OK;
+    }
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_sendstr(r, "{\"ok\":true,\"offline_s\":45}");
+    vTaskDelay(pdMS_TO_TICKS(300));      /* let the reply leave first */
+    thermal_request_test();
+    return ESP_OK;
+}
+
 /* Set or change the admin password. auth_set() checks the current one. */
 static esp_err_t h_passwd(httpd_req_t *r)
 {
@@ -777,6 +852,7 @@ esp_err_t web_server_start(void)
         { .uri = "/api/auth",     .method = HTTP_POST, .handler = h_auth_probe  },
         { .uri = "/api/passwd",   .method = HTTP_POST, .handler = h_passwd      },
         { .uri = "/api/ota",      .method = HTTP_POST, .handler = ota_http_handler },
+        { .uri = "/api/thermaltest", .method = HTTP_POST, .handler = h_thermal_test },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(srv, &routes[i]));

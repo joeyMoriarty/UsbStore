@@ -47,10 +47,17 @@
          font-size:13px;color:var(--muted);word-break:break-all}
   .pill{display:inline-block;font-size:12px;padding:2px 8px;border-radius:99px;
         border:1px solid var(--line);color:var(--muted);margin-right:6px}
+  .pill.ok{color:var(--ok);border-color:var(--ok)}
+  .pill.warm{color:#b7791f;border-color:#b7791f}
+  .pill.hot{color:var(--danger);border-color:var(--danger)}
+  h1 .pill{font-size:12px;vertical-align:middle;margin-left:8px;font-weight:500}
   .tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
   .tab{font-size:13px;padding:6px 12px;max-width:100%;overflow:hidden;
        text-overflow:ellipsis;white-space:nowrap}
   .tab.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  .tab.parked:not(.on){color:var(--muted);border-style:dashed}
+  .tab.failed{color:var(--danger);border-color:var(--danger)}
+  .tab.on.failed{background:var(--danger);color:#fff}
   .msg{font-size:13px;padding:8px 10px;border-radius:7px;margin-top:10px;display:none}
   .msg.show{display:block}
   .msg.err{background:color-mix(in srgb,var(--danger) 14%,transparent);color:var(--danger)}
@@ -69,7 +76,7 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>UsbStore</h1>
+  <h1>UsbStore<span class="pill" id="temp" title="Chip die temperature">chip –</span></h1>
   <div class="sub" id="sub">connecting…</div>
 
   <!-- Shown only when running from the setup AP -->
@@ -153,6 +160,23 @@
 
   <div class="card">
     <div class="row">
+      <strong class="grow">Chip health</strong>
+      <span class="pill" id="thermState">–</span>
+    </div>
+    <div class="msg" id="coolMsg"></div>
+    <div class="hint" id="thermInfo"></div>
+    <div class="row" style="margin-top:10px">
+      <button id="coolTest">Test cool-down</button>
+    </div>
+    <div class="hint">This is the chip's own die temperature. The warmest part
+      of the board is usually the voltage regulator, which this sensor can't
+      see. The test runs the real overheat sequence — drives unmounted, USB
+      suspended, WiFi off, light sleep — for 30 s, so the board is offline for
+      about a minute and then restarts.</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
       <strong class="grow">Firmware</strong>
       <span class="pill" id="ver">–</span>
     </div>
@@ -221,6 +245,7 @@ async function status() {
       : `setup mode · connect to ${ssid}, then open ${ip}`;
     $('setup').style.display = s.provisioned ? 'none' : 'block';
     authSet = !!s.auth;
+    renderThermal(s);
     $('nag').style.display = (s.provisioned && !s.auth) ? 'block' : 'none';
     $('ver').textContent = s.version || '–';
 
@@ -228,8 +253,12 @@ async function status() {
     // "nothing reaches the S3" from "the hub arrives but no drive does".
     const usb = s.usb || [];
     $('drives').innerHTML = (drives.length
-      ? drives.map(d => `<span class="pill">${esc(d.path)} · ${esc(d.name)} · ${fmt(d.bytes)}</span>`).join('')
-      : '<span class="pill">no drives mounted</span>')
+      ? drives.map(d => `<span class="pill">${esc(d.path)} · ${esc(d.name)} · ${
+          d.state === 'failed' ? esc(d.note) : d.state === 'parked' ? 'parked' : fmt(d.bytes)}</span>`).join('')
+        + (drives.length > 2
+          ? '<div class="hint">More than two drives: the S3 can keep only one open at a time. Switching to a parked drive takes a moment.</div>'
+          : '')
+      : '<span class="pill">no drives</span>')
       + '<div class="hint">USB bus: ' + (usb.length
         ? usb.map(u => `${esc(u.kind)} ${esc(u.id)} (${esc(u.speed)})`).join(' · ')
         : 'nothing detected — no signal is reaching the S3 (cable, adapter or hub power)')
@@ -257,13 +286,29 @@ async function status() {
 // match "/usb10", so require the path to be the root or sit beneath it.
 const driveOf = p => drives.find(d => p === d.path || p.startsWith(d.path + '/'));
 
+// Parked drives are recognised but not mounted (the S3 runs out of USB
+// channels past two open drives); opening one swaps it in on the server.
+const tabLabel = d =>
+  d.state === 'failed' ? d.note :
+  d.state === 'parked' ? (d.bytes ? fmt(d.bytes) + ' · parked' : 'parked') :
+  fmt(d.bytes);
+
 function renderTabs() {
   const cur = cwd && driveOf(cwd);
   $('tabs').innerHTML = drives.map((d, i) =>
-    `<button class="tab${cur && cur.path === d.path ? ' on' : ''}" data-t="${i}"
-       title="${esc(d.path)}">${esc(d.name.trim() || d.path)} · ${fmt(d.bytes)}</button>`).join('');
+    `<button class="tab ${esc(d.state || 'open')}${cur && cur.path === d.path ? ' on' : ''}" data-t="${i}"
+       title="${esc(d.path)}">${esc(d.name.trim() || d.path)} · ${esc(tabLabel(d))}</button>`).join('');
   $('tabs').querySelectorAll('[data-t]').forEach(b => {
-    b.onclick = () => { cwd = drives[+b.dataset.t].path; list(); };
+    b.onclick = async () => {
+      const d = drives[+b.dataset.t];
+      cwd = d.path;
+      if (d.state === 'parked') note($('msg'), 'Opening ' + (d.name || d.path) + '…');
+      const ok = await list();
+      if (d.state === 'parked') {
+        if (ok) $('msg').className = 'msg';   // keep the message if it failed
+        status();                             // tab states changed on the server
+      }
+    };
   });
   // A single drive needs no switcher.
   $('tabs').style.display = drives.length > 1 ? 'flex' : 'none';
@@ -305,8 +350,14 @@ async function list() {
         } catch (err) { note($('msg'), err.message, 'err'); }
       };
     });
+    return true;
   } catch (e) {
+    // Don't leave the previous drive's files showing under the new tab.
+    $('crumb').textContent = cwd;
+    $('rows').innerHTML = '';
+    $('empty').style.display = 'none';
     note($('msg'), e.message, 'err');
+    return false;
   }
 }
 
@@ -434,6 +485,53 @@ async function crashCheck() {
          `Backtrace: ${bt || 'unavailable'}`, 'err');
   } catch (e) {}
 }
+
+/* ---- chip temperature ----------------------------------------------- */
+const fmtC = c => c == null ? '–' : c.toFixed(1) + ' °C';
+let coolShown = false;
+
+function renderThermal(s) {
+  const cls = s.thermal === 'cooling' ? 'hot' : s.thermal === 'warm' ? 'warm' : 'ok';
+  $('temp').textContent = s.temp_c == null ? 'chip –' : `chip ${Math.round(s.temp_c)} °C`;
+  $('temp').className = 'pill ' + cls;
+  $('thermState').textContent =
+    ({ normal: 'normal', warm: 'throttled', cooling: 'cooling down' })[s.thermal] || s.thermal;
+  $('thermState').className = 'pill ' + cls;
+  $('thermInfo').textContent =
+    `Now ${fmtC(s.temp_c)}, peak since boot ${fmtC(s.temp_peak_c)}. ` +
+    `At ${s.therm_warm_c} °C it throttles (CPU 80 MHz, WiFi power save) and stays online; ` +
+    `at ${s.therm_hot_c} °C it unmounts the drives and sleeps until cool.`;
+
+  // Shown once per page load, and kept (not auto-hidden): the box went
+  // offline, and this is the only place that says why.
+  const c = s.cooldown;
+  if (c && !coolShown) {
+    coolShown = true;
+    const el = $('coolMsg');
+    el.textContent = c.test
+      ? `Cool-down test passed: drives unmounted, slept ${c.slept_s} s, restarted cleanly.`
+      : `Overheated at ${fmtC(c.peak_c)}. Drives were unmounted safely and the board ` +
+        `slept ${c.slept_s} s, cooling to ${fmtC(c.end_c)}, then restarted.`;
+    el.className = 'msg show ' + (c.test ? 'good' : 'err');
+  }
+}
+
+$('coolTest').onclick = async () => {
+  if (!confirm('Run the overheat cool-down now? All drives are unmounted, ' +
+               'the board goes offline for about a minute, then restarts.')) return;
+  try {
+    await api('/api/thermaltest', { method: 'POST' });
+  } catch (e) { note($('coolMsg'), e.message, 'err'); return; }
+
+  note($('coolMsg'), 'Cooling down — back in about a minute…');
+  coolShown = false;                       // let the result banner show
+  await new Promise(r => setTimeout(r, 40000));
+  for (let i = 0; i < 30; i++) {
+    try { await api('/api/status'); status(); return; }
+    catch (e) { await new Promise(r => setTimeout(r, 3000)); }
+  }
+  note($('coolMsg'), 'Not back after two minutes — check the power and the log.', 'err');
+};
 
 /* ---- admin password ------------------------------------------------- */
 $('setpw').onclick = async () => {

@@ -27,3 +27,10 @@ void wifi_mgr_status(char *out, size_t len);
 
 /* Store credentials and reboot into station mode. Called by the setup page. */
 esp_err_t wifi_mgr_provision(const char *ssid, const char *pass);
+
+/* Turn WiFi off and suppress reconnects, for the thermal cool-down. There is
+ * no resume: the cool-down ends in a reboot, which is the clean way back. */
+void wifi_mgr_pause(void);
+
+/* Radio power saving on/off - part of thermal throttling. */
+void wifi_mgr_power_save(bool on);
