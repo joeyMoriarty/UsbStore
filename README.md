@@ -169,6 +169,12 @@ need to — updates go over WiFi.
    network.
 4. Open **http://usbstore.local** (or the IP shown in the log).
 
+Your router may hand the board a different LAN IP after a lease renewal;
+`usbstore.local` follows it automatically. Android doesn't always resolve
+`.local` names — if yours doesn't, reserve a fixed IP for the board's MAC
+address in your router's DHCP settings. (Your ISP changing your *public* IP
+doesn't matter at all: nothing here uses it.)
+
 ### Drives
 
 - **FAT32 only.** ESP-IDF's FatFs is built without exFAT. Large drives work —
@@ -180,6 +186,20 @@ need to — updates go over WiFi.
   channels; the hub and each drive's endpoints each take some.
 - Drives are numbered `/usb0`, `/usb1`, … in **plug-in order**, so numbers can
   swap after a replug.
+
+## Data safety
+
+- **Reading never writes.** FatFs doesn't update access times, so browsing and
+  downloading can't damage a drive.
+- **Writes are the risky moment.** FAT32 has no journal: losing power or
+  pulling a drive mid-upload or mid-delete can leave a half-written file or
+  orphaned clusters. Failed uploads are deleted automatically, and every file
+  is closed after each operation, so **pulling a drive while it's idle is
+  safe.**
+- **Unstable power is the real-world risk.** A brownout during a write is how
+  FAT gets damaged — see [Hardware and power](#hardware-and-power-read-this-first).
+- **One pendrive is not a backup.** That's what RAID 1 on the roadmap is for.
+  If a drive was pulled mid-write, run `chkdsk X: /f` on a PC.
 
 ## Updating over WiFi
 
