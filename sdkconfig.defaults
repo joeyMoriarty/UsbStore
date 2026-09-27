@@ -1,0 +1,83 @@
+# UsbStore defaults. Delete sdkconfig (not this file) to re-apply.
+
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---- Console -------------------------------------------------------------
+# The native USB peripheral is the HOST port for the hub, so it cannot also
+# carry the console. Route stdio to UART0 = GPIO43 (TX) / GPIO44 (RX) and
+# watch it with an external CP2102/CH340 adapter.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM_0=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+# IDF also enables a SECONDARY console on USB Serial/JTAG by default. On the S3
+# that peripheral shares the USB PHY with the OTG controller hosting the hub,
+# so it would be writing into a port it no longer owns.
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# ---- USB host ------------------------------------------------------------
+# External hub support. Without the first line a hub enumerates but its
+# downstream ports are invisible, which looks exactly like a dead hub.
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+CONFIG_USB_HOST_HUB_MULTI_LEVEL=y
+# The S3 has 8 host channels total. Each downstream device needs one free
+# channel to enumerate plus one per endpoint to claim its interface, and the
+# hub itself consumes some. That is the real ceiling on drive count, not RAM.
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=256
+
+# ---- PSRAM: ESP32-S3FH4R2 is 2MB QUAD ------------------------------------
+# Octal on an R2 part fails to init or breaks boot. Do not "upgrade" this.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+
+# ---- Flash / partitions --------------------------------------------------
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- FATFS ---------------------------------------------------------------
+# One FAT volume per mounted drive. The default of 2 silently caps the box at
+# two pendrives: a third enumerates fine and then fails to mount. Matches
+# USBSTORE_MAX_DRIVES in usb_storage.h.
+CONFIG_FATFS_VOLUME_COUNT=4
+# Long filenames on the heap, UTF-8 in the API so non-ASCII names survive
+# the round trip to the browser.
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+CONFIG_FATFS_API_ENCODING_UTF_8=y
+CONFIG_FATFS_CODEPAGE_437=y
+
+# ---- Sockets ---------------------------------------------------------------
+# lwIP's default of 10 is used up exactly by httpd (2 internal + 7 clients)
+# plus the UDP log socket, so a busy page got "error in accept (23)".
+CONFIG_LWIP_MAX_SOCKETS=16
+
+# ---- HTTP server ---------------------------------------------------------
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=768
+
+# ---- OTA with rollback ---------------------------------------------------
+# A freshly flashed image boots on probation and is only confirmed after it
+# has run long enough to be reachable. If it panics or hangs first, the next
+# reset boots the previous image - a bad build cannot lock you out.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# ---- Crash visibility without a serial adapter ---------------------------
+# A panic kills the network stack before anything can be sent, so it never
+# reaches the UDP/HTTP log. Writing the dump to flash means the backtrace
+# survives the reboot and can be fetched from /api/crash afterwards.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+CONFIG_ESP_COREDUMP_STACK_SIZE=1280
+# Keep the panic handler printing a backtrace rather than silently rebooting.
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+
+# ---- Misc ----------------------------------------------------------------
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096

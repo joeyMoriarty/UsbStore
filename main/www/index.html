@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UsbStore</title>
+<style>
+  :root{
+    --bg:#f7f7f8; --panel:#fff; --line:#e3e3e6; --fg:#1b1b1f;
+    --muted:#6b6b73; --accent:#2d6cdf; --danger:#c0392b; --ok:#1e8e4f;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --bg:#16161a; --panel:#1f1f25; --line:#32323b; --fg:#ececf1;
+      --muted:#9a9aa5; --accent:#5b8ff0; --danger:#e06c5b; --ok:#4cc38a;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:860px;margin:0 auto;padding:16px}
+  h1{font-size:20px;margin:0 0 2px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:16px}
+  .card{background:var(--panel);border:1px solid var(--line);
+        border-radius:10px;padding:14px;margin-bottom:14px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .grow{flex:1;min-width:0}
+  button{font:inherit;padding:7px 13px;border-radius:7px;cursor:pointer;
+         border:1px solid var(--line);background:var(--panel);color:var(--fg)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.link{border:0;background:none;color:var(--accent);padding:4px 6px}
+  button.del{border:0;background:none;color:var(--danger);padding:4px 6px}
+  button:disabled{opacity:.5;cursor:default}
+  input{font:inherit;padding:7px 10px;border:1px solid var(--line);
+        border-radius:7px;background:var(--bg);color:var(--fg);width:100%}
+  table{width:100%;border-collapse:collapse}
+  td,th{padding:8px 6px;border-bottom:1px solid var(--line);text-align:left}
+  th{font-size:12px;text-transform:uppercase;color:var(--muted);
+     letter-spacing:.04em}
+  td.size{text-align:right;color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+  td.act{text-align:right;white-space:nowrap}
+  .name{background:none;border:0;color:var(--fg);font:inherit;cursor:pointer;
+        padding:0;text-align:left;max-width:100%;overflow:hidden;
+        text-overflow:ellipsis;white-space:nowrap}
+  .name.dir{color:var(--accent);font-weight:500}
+  .crumb{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+         font-size:13px;color:var(--muted);word-break:break-all}
+  .pill{display:inline-block;font-size:12px;padding:2px 8px;border-radius:99px;
+        border:1px solid var(--line);color:var(--muted);margin-right:6px}
+  .tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+  .tab{font-size:13px;padding:6px 12px;max-width:100%;overflow:hidden;
+       text-overflow:ellipsis;white-space:nowrap}
+  .tab.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  .msg{font-size:13px;padding:8px 10px;border-radius:7px;margin-top:10px;display:none}
+  .msg.show{display:block}
+  .msg.err{background:color-mix(in srgb,var(--danger) 14%,transparent);color:var(--danger)}
+  .msg.good{background:color-mix(in srgb,var(--ok) 14%,transparent);color:var(--ok)}
+  .bar{height:5px;background:var(--line);border-radius:99px;overflow:hidden;
+       margin-top:10px;display:none}
+  .bar.show{display:block}
+  .bar i{display:block;height:100%;background:var(--accent);width:0}
+  .empty{color:var(--muted);font-size:14px;padding:18px 4px;text-align:center}
+  .hint{font-size:12px;color:var(--muted);margin-top:8px}
+  pre.log{margin:10px 0 0;padding:10px;background:var(--bg);color:var(--fg);
+          border:1px solid var(--line);border-radius:7px;height:240px;
+          overflow:auto;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
+          white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>UsbStore</h1>
+  <div class="sub" id="sub">connecting…</div>
+
+  <!-- Shown only when running from the setup AP -->
+  <div class="card" id="setup" style="display:none">
+    <strong>Join a network</strong>
+    <div class="hint">Credentials are saved to NVS and the board reboots onto
+      your WiFi. Afterwards reach it at <code>http://usbstore.local</code>.</div>
+    <div class="row" style="margin-top:10px">
+      <div class="grow"><input id="ssid" placeholder="Network name (SSID)"></div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <div class="grow"><input id="pass" type="password" placeholder="WiFi password"></div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <div class="grow"><input id="admin" type="password"
+        placeholder="New admin password for this box (4+ chars)"></div>
+      <button class="primary" id="join">Save &amp; reboot</button>
+    </div>
+    <div class="hint">The admin password protects uploads, deletes and
+      firmware updates. Setting it here means the box never sits on your
+      network with those open.</div>
+    <div class="msg" id="setupMsg"></div>
+  </div>
+
+  <!-- Shown when no admin password exists yet -->
+  <div class="card" id="nag" style="display:none">
+    <strong>Set an admin password</strong>
+    <div class="hint">Right now anyone on your WiFi can delete files or flash
+      new firmware onto this board.</div>
+    <div class="row" style="margin-top:10px">
+      <div class="grow"><input id="newpw" type="password" placeholder="4-63 characters"></div>
+      <button class="primary" id="setpw">Set password</button>
+    </div>
+    <div class="msg" id="nagMsg"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div class="grow" id="drives"><span class="pill">no drives</span></div>
+      <button id="refresh">Refresh</button>
+    </div>
+  </div>
+
+  <div class="card" id="browser" style="display:none">
+    <!-- One tab per mounted drive; the only way to reach /usb1 and beyond. -->
+    <div class="tabs" id="tabs"></div>
+    <div class="row">
+      <button class="link" id="up">&#8593; Up</button>
+      <div class="grow crumb" id="crumb">/</div>
+    </div>
+
+    <table>
+      <thead><tr><th>Name</th><th class="size">Size</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" style="display:none">This folder is empty.</div>
+
+    <div class="row" style="margin-top:14px">
+      <button id="pick">Upload file</button>
+      <input type="file" id="file" style="display:none">
+      <button id="newdir">New folder</button>
+    </div>
+    <div class="bar" id="bar"><i id="barFill"></i></div>
+    <div class="msg" id="msg"></div>
+    <div class="hint">Transfers run at roughly 350–540 KB/s — that is the
+      ESP32-S3's USB bus, not the network. Large files take a while.</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <strong class="grow">Console</strong>
+      <button id="logPause">Pause</button>
+      <button id="logClear">Clear</button>
+    </div>
+    <div class="msg" id="crash"></div>
+    <pre class="log" id="log">waiting for log…</pre>
+    <div class="hint">Live log over WiFi. A panic cannot reach this — the
+      network stack is already down — so crashes are written to flash and
+      reported in the banner above after the reboot.</div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <strong class="grow">Firmware</strong>
+      <span class="pill" id="ver">–</span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="otaPick">Upload firmware (.bin)</button>
+      <input type="file" id="otaFile" accept=".bin" style="display:none">
+    </div>
+    <div class="bar" id="otaBar"><i id="otaFill"></i></div>
+    <div class="msg" id="otaMsg"></div>
+    <div class="hint">Use <code>build/usbstore.bin</code>. No need to unplug the
+      hub. The new version runs on probation for a minute: if it crashes
+      first, the board goes back to this version on its own.</div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let cwd = null, drives = [];
+
+const fmt = b => {
+  if (!b) return '';
+  const u = ['B','KB','MB','GB'];
+  let i = 0; while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return b.toFixed(i ? 1 : 0) + ' ' + u[i];
+};
+
+// Every file and drive name comes from a pendrive, i.e. from whoever wrote
+// it. Escape before it touches innerHTML, or a crafted filename runs script
+// here - with the admin password cached, that script could flash firmware.
+const esc = s => String(s).replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+let authSet = false;
+
+// Trigger the browser's login prompt up front, before a large body is sent,
+// by hitting a cheap protected endpoint. Once answered, the browser attaches
+// the credentials to every later /api/ request on its own.
+async function ensureAuth() {
+  if (!authSet) return true;
+  const r = await fetch('/api/auth', { method: 'POST' });
+  return r.ok;
+}
+
+function note(el, text, kind) {
+  el.textContent = text;
+  el.className = 'msg show ' + (kind || '');
+  if (kind === 'good') setTimeout(() => el.className = 'msg', 3000);
+}
+
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  const t = await r.text();
+  let j = null; try { j = JSON.parse(t); } catch (e) {}
+  if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+  return j;
+}
+
+async function status() {
+  try {
+    const s = await api('/api/status');
+    drives = s.drives || [];
+
+    const [mode, ssid, ip] = (s.wifi || '').split(':');
+    $('sub').textContent = mode === 'station'
+      ? `on ${ssid} at ${ip} · up ${Math.floor(s.uptime_s / 60)} min`
+      : `setup mode · connect to ${ssid}, then open ${ip}`;
+    $('setup').style.display = s.provisioned ? 'none' : 'block';
+    authSet = !!s.auth;
+    $('nag').style.display = (s.provisioned && !s.auth) ? 'block' : 'none';
+    $('ver').textContent = s.version || '–';
+
+    // Drives, then everything on the bus. The bus line is what separates
+    // "nothing reaches the S3" from "the hub arrives but no drive does".
+    const usb = s.usb || [];
+    $('drives').innerHTML = (drives.length
+      ? drives.map(d => `<span class="pill">${esc(d.path)} · ${esc(d.name)} · ${fmt(d.bytes)}</span>`).join('')
+      : '<span class="pill">no drives mounted</span>')
+      + '<div class="hint">USB bus: ' + (usb.length
+        ? usb.map(u => `${esc(u.kind)} ${esc(u.id)} (${esc(u.speed)})`).join(' · ')
+        : 'nothing detected — no signal is reaching the S3 (cable, adapter or hub power)')
+      + '</div>';
+
+    $('browser').style.display = drives.length ? 'block' : 'none';
+
+    // Only re-list when the drive under us changed. Re-reading the folder on
+    // every poll competes with transfers on a ~500 KB/s bus and resets the
+    // view mid-browse.
+    const prev = cwd;
+    if (drives.length && (!cwd || !driveOf(cwd))) {
+      cwd = drives[0].path;
+    } else if (!drives.length) {
+      cwd = null;
+    }
+    if (cwd && cwd !== prev) await list();
+    else renderTabs();   // a drive plugged in elsewhere still needs its tab
+  } catch (e) {
+    $('sub').textContent = 'cannot reach the board: ' + e.message;
+  }
+}
+
+// The drive whose tree cwd is in. Matching on "/usb1" alone would also
+// match "/usb10", so require the path to be the root or sit beneath it.
+const driveOf = p => drives.find(d => p === d.path || p.startsWith(d.path + '/'));
+
+function renderTabs() {
+  const cur = cwd && driveOf(cwd);
+  $('tabs').innerHTML = drives.map((d, i) =>
+    `<button class="tab${cur && cur.path === d.path ? ' on' : ''}" data-t="${i}"
+       title="${esc(d.path)}">${esc(d.name.trim() || d.path)} · ${fmt(d.bytes)}</button>`).join('');
+  $('tabs').querySelectorAll('[data-t]').forEach(b => {
+    b.onclick = () => { cwd = drives[+b.dataset.t].path; list(); };
+  });
+  // A single drive needs no switcher.
+  $('tabs').style.display = drives.length > 1 ? 'flex' : 'none';
+}
+
+async function list() {
+  renderTabs();
+  try {
+    const d = await api('/api/list?p=' + encodeURIComponent(cwd));
+    $('crumb').textContent = cwd;
+    const es = (d.entries || []).sort(
+      (a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
+
+    $('empty').style.display = es.length ? 'none' : 'block';
+    $('rows').innerHTML = es.map((e, i) => `
+      <tr>
+        <td><button class="name ${e.dir ? 'dir' : ''}" data-i="${i}">${
+              e.dir ? '&#128193; ' : ''}${esc(e.name)}</button></td>
+        <td class="size">${e.dir ? '' : fmt(e.size)}</td>
+        <td class="act"><button class="del" data-d="${i}">Delete</button></td>
+      </tr>`).join('');
+
+    $('rows').querySelectorAll('[data-i]').forEach(b => {
+      b.onclick = () => {
+        const e = es[+b.dataset.i];
+        const p = cwd + '/' + e.name;
+        if (e.dir) { cwd = p; list(); }
+        else { window.location = '/api/dl?p=' + encodeURIComponent(p); }
+      };
+    });
+    $('rows').querySelectorAll('[data-d]').forEach(b => {
+      b.onclick = async () => {
+        const e = es[+b.dataset.d];
+        if (!confirm('Delete ' + e.name + '?')) return;
+        try {
+          await api('/api/rm?p=' + encodeURIComponent(cwd + '/' + e.name),
+                    { method: 'POST' });
+          list();
+        } catch (err) { note($('msg'), err.message, 'err'); }
+      };
+    });
+  } catch (e) {
+    note($('msg'), e.message, 'err');
+  }
+}
+
+$('refresh').onclick = async () => { await status(); if (cwd) list(); };
+
+$('up').onclick = () => {
+  if (drives.some(d => d.path === cwd)) return;   // already at a mount root
+  cwd = cwd.slice(0, cwd.lastIndexOf('/')) || '/';
+  list();
+};
+
+$('newdir').onclick = async () => {
+  const n = prompt('Folder name');
+  if (!n) return;
+  try {
+    await api('/api/mkdir?p=' + encodeURIComponent(cwd + '/' + n),
+              { method: 'POST' });
+    list();
+  } catch (e) { note($('msg'), e.message, 'err'); }
+};
+
+$('pick').onclick = () => $('file').click();
+
+$('file').onchange = async () => {
+  const f = $('file').files[0];
+  if (!f) return;
+  if (!(await ensureAuth())) {
+    note($('msg'), 'password required', 'err');
+    $('file').value = '';
+    return;
+  }
+
+  // XHR rather than fetch: upload progress matters when a 50MB file takes
+  // minutes on a 350 KB/s bus, and fetch cannot report it.
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/ul?p=' + encodeURIComponent(cwd + '/' + f.name));
+  $('bar').className = 'bar show';
+  $('pick').disabled = true;
+
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable) {
+      $('barFill').style.width = (e.loaded / e.total * 100) + '%';
+    }
+  };
+  xhr.onload = () => {
+    $('bar').className = 'bar';
+    $('barFill').style.width = '0';
+    $('pick').disabled = false;
+    $('file').value = '';
+    if (xhr.status === 200) { note($('msg'), 'Uploaded ' + f.name, 'good'); list(); }
+    else {
+      let m = 'upload failed';
+      try { m = JSON.parse(xhr.responseText).error || m; } catch (e) {}
+      note($('msg'), m, 'err');
+    }
+  };
+  xhr.onerror = () => {
+    $('bar').className = 'bar';
+    $('pick').disabled = false;
+    note($('msg'), 'connection lost during upload', 'err');
+  };
+  xhr.send(f);
+};
+
+$('join').onclick = async () => {
+  const ssid = $('ssid').value.trim();
+  if (!ssid) { note($('setupMsg'), 'Enter a network name', 'err'); return; }
+  try {
+    await api('/api/wifi', {
+      method: 'POST',
+      body: JSON.stringify({ ssid, pass: $('pass').value, admin: $('admin').value })
+    });
+    note($('setupMsg'),
+         'Saved. Rebooting — reconnect to your own WiFi and open http://usbstore.local',
+         'good');
+  } catch (e) { note($('setupMsg'), e.message, 'err'); }
+};
+
+/* ---- console -------------------------------------------------------- */
+let logCursor = 0, logPaused = false, logStarted = false;
+
+$('logPause').onclick = () => {
+  logPaused = !logPaused;
+  $('logPause').textContent = logPaused ? 'Resume' : 'Pause';
+};
+$('logClear').onclick = () => { $('log').textContent = ''; };
+
+async function pollLog() {
+  if (logPaused) return;
+  try {
+    const r = await fetch('/api/log?since=' + logCursor);
+    if (!r.ok) return;
+    const next = r.headers.get('X-Log-Cursor');
+    const txt = await r.text();
+
+    // A cursor that went backwards means the board rebooted under us.
+    if (next !== null && +next < logCursor) {
+      $('log').textContent += '\n--- board restarted ---\n';
+      logCursor = 0;
+      return;
+    }
+    if (next !== null) logCursor = +next;
+
+    if (txt) {
+      const el = $('log');
+      if (!logStarted) { el.textContent = ''; logStarted = true; }
+      const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      el.textContent += txt;
+      // Keep the DOM from growing without bound on a long session.
+      if (el.textContent.length > 60000) {
+        el.textContent = el.textContent.slice(-40000);
+      }
+      if (atBottom) el.scrollTop = el.scrollHeight;
+    }
+  } catch (e) { /* board rebooting; next tick retries */ }
+}
+
+async function crashCheck() {
+  try {
+    const c = await api('/api/crash');
+    if (!c.crash) { $('crash').className = 'msg'; return; }
+    const bt = (c.backtrace || []).join(' ');
+    note($('crash'),
+         `Crashed last boot in task "${c.task}" at ${c.pc}. ` +
+         `Backtrace: ${bt || 'unavailable'}`, 'err');
+  } catch (e) {}
+}
+
+/* ---- admin password ------------------------------------------------- */
+$('setpw').onclick = async () => {
+  try {
+    await api('/api/passwd', {
+      method: 'POST',
+      body: JSON.stringify({ next: $('newpw').value })
+    });
+    $('newpw').value = '';
+    note($('nagMsg'), 'Password set. Your browser will ask for it (user "admin") on the next change.', 'good');
+    status();
+  } catch (e) { note($('nagMsg'), e.message, 'err'); }
+};
+
+/* ---- firmware update ------------------------------------------------ */
+$('otaPick').onclick = () => $('otaFile').click();
+
+// After an update the board reboots; poll until it answers again.
+async function waitForReboot(oldVer) {
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    try {
+      const s = await api('/api/status');
+      note($('otaMsg'), `Back up, running ${s.version}. It is confirmed after a minute of stable running.`, 'good');
+      status();
+      return;
+    } catch (e) { /* still rebooting */ }
+  }
+  note($('otaMsg'), 'Board has not come back after 80 s. If the new build crashed, it will roll back to ' + oldVer + ' on its next reset.', 'err');
+}
+
+$('otaFile').onchange = async () => {
+  const f = $('otaFile').files[0];
+  $('otaFile').value = '';
+  if (!f) return;
+  if (!confirm(`Flash ${f.name} (${fmt(f.size)}) and reboot?`)) return;
+  if (!(await ensureAuth())) { note($('otaMsg'), 'password required', 'err'); return; }
+
+  const oldVer = $('ver').textContent;
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/ota');
+  $('otaBar').className = 'bar show';
+  $('otaPick').disabled = true;
+  xhr.upload.onprogress = e => {
+    if (e.lengthComputable) $('otaFill').style.width = (e.loaded / e.total * 100) + '%';
+  };
+  const done = () => {
+    $('otaBar').className = 'bar';
+    $('otaFill').style.width = '0';
+    $('otaPick').disabled = false;
+  };
+  xhr.onload = () => {
+    done();
+    if (xhr.status === 200) {
+      note($('otaMsg'), 'Written. Rebooting…');
+      waitForReboot(oldVer);
+    } else {
+      let m = 'update failed';
+      try { m = JSON.parse(xhr.responseText).error || m; } catch (e) {}
+      note($('otaMsg'), m, 'err');
+    }
+  };
+  xhr.onerror = () => { done(); note($('otaMsg'), 'connection lost during upload', 'err'); };
+  xhr.send(f);
+};
+
+status();
+crashCheck();
+pollLog();
+setInterval(() => { if (document.visibilityState === 'visible') status(); }, 15000);
+setInterval(() => { if (document.visibilityState === 'visible') pollLog(); }, 1000);
+</script>
+</body>
+</html>

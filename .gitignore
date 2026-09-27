@@ -1,0 +1,13 @@
+# Build output and downloaded registry components (restored by the build).
+build/
+managed_components/
+
+# Generated from sdkconfig.defaults on first build. sdkconfig.defaults is the
+# source of truth; committing sdkconfig would pin one machine's full config.
+sdkconfig
+sdkconfig.old
+
+# Editor state; .vscode/settings.json holds a machine-specific IDF path.
+.vscode/
+.cache/
+*.swp

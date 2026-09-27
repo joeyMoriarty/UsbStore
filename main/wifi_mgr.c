@@ -1,0 +1,179 @@
+#include <string.h>
+#include <stdio.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_mac.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "mdns.h"
+
+#include "wifi_mgr.h"
+#include "netlog.h"
+
+static const char *TAG = "wifi";
+static const char *NVS_NS = "wifi";
+
+#define GOT_IP   BIT0
+#define GAVE_UP  BIT1
+#define MAX_TRY  5
+
+static EventGroupHandle_t s_events;
+static bool  s_station;
+static char  s_ip[16] = "0.0.0.0";
+static char  s_ssid[33];
+static int   s_tries;
+
+static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (++s_tries <= MAX_TRY) {
+            ESP_LOGW(TAG, "retry %d/%d", s_tries, MAX_TRY);
+            esp_wifi_connect();
+        } else {
+            xEventGroupSetBits(s_events, GAVE_UP);
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&e->ip_info.ip));
+        s_tries = 0;
+        xEventGroupSetBits(s_events, GOT_IP);
+    }
+}
+
+static bool load_creds(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return false;
+    }
+    bool ok = nvs_get_str(h, "ssid", ssid, &ssid_len) == ESP_OK &&
+              nvs_get_str(h, "pass", pass, &pass_len) == ESP_OK &&
+              ssid[0] != '\0';
+    nvs_close(h);
+    return ok;
+}
+
+esp_err_t wifi_mgr_provision(const char *ssid, const char *pass)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if ((err = nvs_set_str(h, "ssid", ssid)) == ESP_OK) {
+        err = nvs_set_str(h, "pass", pass ? pass : "");
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+static void start_setup_ap(void)
+{
+    ESP_LOGW(TAG, "no usable credentials - raising setup AP \"%s\"",
+             WIFI_SETUP_SSID);
+
+    esp_netif_create_default_wifi_ap();
+
+    wifi_config_t ap = {0};
+    snprintf((char *)ap.ap.ssid, sizeof(ap.ap.ssid), "%s", WIFI_SETUP_SSID);
+    snprintf((char *)ap.ap.password, sizeof(ap.ap.password), "%s", WIFI_SETUP_PASS);
+    ap.ap.ssid_len       = strlen(WIFI_SETUP_SSID);
+    ap.ap.channel        = 1;
+    ap.ap.max_connection = 2;
+    ap.ap.authmode       = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    s_station = false;
+    snprintf(s_ip, sizeof(s_ip), "192.168.4.1");
+    /* Broadcast still reaches anything joined to our own AP, so remote logs
+     * work during setup too - which is when they are needed most. */
+    netlog_set_network_ready(true);
+}
+
+esp_err_t wifi_mgr_start(void)
+{
+    s_events = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, on_wifi, NULL, NULL));
+
+    wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init));
+
+    char ssid[33] = {0}, pass[65] = {0};
+    if (load_creds(ssid, sizeof(ssid), pass, sizeof(pass))) {
+        snprintf(s_ssid, sizeof(s_ssid), "%s", ssid);
+
+        esp_netif_t *sta = esp_netif_create_default_wifi_sta();
+        esp_netif_set_hostname(sta, WIFI_HOSTNAME);
+
+        /* memcpy, not snprintf: these are fixed-width fields, not C strings.
+         * A 32-char SSID or 64-char hex PSK fills them exactly with no NUL,
+         * and snprintf would silently drop the last character. */
+        wifi_config_t cfg = {0};
+        memcpy(cfg.sta.ssid, ssid, strnlen(ssid, sizeof(cfg.sta.ssid)));
+        memcpy(cfg.sta.password, pass, strnlen(pass, sizeof(cfg.sta.password)));
+
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
+        ESP_ERROR_CHECK(esp_wifi_start());
+
+        /* Bounded wait: a retry loop must never stop the drives mounting. */
+        EventBits_t bits = xEventGroupWaitBits(
+            s_events, GOT_IP | GAVE_UP, pdFALSE, pdFALSE, pdMS_TO_TICKS(20000));
+
+        if (bits & GOT_IP) {
+            s_station = true;
+            netlog_set_network_ready(true);
+            ESP_LOGI(TAG, "joined \"%s\" as %s", ssid, s_ip);
+        } else {
+            ESP_LOGW(TAG, "could not join \"%s\"", ssid);
+            esp_wifi_stop();
+            esp_wifi_set_mode(WIFI_MODE_NULL);
+            start_setup_ap();
+        }
+    } else {
+        start_setup_ap();
+    }
+
+    /* mDNS only helps on a real LAN; in AP mode the address is fixed anyway. */
+    if (s_station && mdns_init() == ESP_OK) {
+        mdns_hostname_set(WIFI_HOSTNAME);
+        mdns_instance_name_set("UsbStore");
+        mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+        ESP_LOGI(TAG, "http://%s.local", WIFI_HOSTNAME);
+    }
+    return ESP_OK;
+}
+
+bool wifi_mgr_is_station(void)
+{
+    return s_station;
+}
+
+void wifi_mgr_status(char *out, size_t len)
+{
+    if (s_station) {
+        snprintf(out, len, "station:%s:%s", s_ssid, s_ip);
+    } else {
+        snprintf(out, len, "setup:%s:%s", WIFI_SETUP_SSID, s_ip);
+    }
+}

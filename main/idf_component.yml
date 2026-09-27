@@ -1,0 +1,18 @@
+dependencies:
+  # 5.3 is the floor for external USB hub support (CONFIG_USB_HOST_HUBS_SUPPORTED).
+  idf: ">=5.3"
+
+  # Espressif's USB mass-storage host class driver.
+  espressif/usb_host_msc: "^1.3.0"
+
+  # IDF 6.0 moved the USB Host Library OUT of the core framework and into this
+  # registry component, so it has to be requested explicitly. On 5.x it does
+  # not exist (the stack is built in), hence the version rule rather than a
+  # plain dependency - without this, a 6.x build fails to find usb/usb_host.h.
+  espressif/usb:
+    version: "^1.3.0"
+    rules:
+      - if: "idf_version >=6.0"
+
+  # mDNS (http://usbstore.local) left the core framework before 6.x too.
+  espressif/mdns: "^1.8.0"
