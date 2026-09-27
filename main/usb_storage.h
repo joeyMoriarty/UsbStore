@@ -40,6 +40,7 @@ typedef struct {
     uint64_t capacity;     /* bytes; 0 until the drive has been opened once */
     char     state[8];     /* "open", "parked" or "failed" */
     char     note[48];     /* why it failed, when state is "failed" */
+    char     serial[40];   /* USB serial number: stable across replugs; may be empty */
 } usbstore_drive_t;
 
 /* Every enumerated device, not just drives - except hubs, which the host
@@ -54,6 +55,7 @@ typedef struct {
     char     kind[16];     /* "hub", "mass-storage", ... */
     char     speed[6];     /* "low" / "full" / "high" */
     char     product[40];  /* from the string descriptor, if the device has one */
+    char     serial[40];   /* likewise; what makes one drive distinguishable from its twin */
 } usbstore_usbdev_t;
 
 esp_err_t usbstore_start(void);
@@ -66,9 +68,17 @@ int usbstore_census(usbstore_usbdev_t *out, int max);
  * read while transfers run, and is for display only. */
 int usbstore_list(usbstore_drive_t *out, int max);
 
-/* True if path sits inside a known drive (open or parked) and contains no
- * "..". A cheap first filter; usbstore_acquire() re-checks under the lock. */
+/* True if path sits inside a known drive (open or parked) and is in plain
+ * canonical form - no "..", no "//", no backslashes. A cheap first filter;
+ * usbstore_acquire() re-checks the drive under the lock. */
 bool usbstore_path_ok(const char *path);
+
+/* The mount point ("/usbN") of the drive with this USB serial number, if it
+ * is plugged in. Drive numbers follow plug-in order; serials don't. */
+bool usbstore_base_for_serial(const char *serial, char *base, size_t len);
+
+/* The serial number of the drive holding `path`, if known. */
+bool usbstore_serial_for_path(const char *path, char *serial, size_t len);
 
 /*
  * ---- Using a drive ------------------------------------------------------

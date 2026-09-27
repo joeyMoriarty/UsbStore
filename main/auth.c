@@ -13,6 +13,8 @@ static const char *NVS_NS = "auth";
  * request is a single comparison. Empty when no password is set. */
 static char s_expected[160];
 
+static void devkey_load(void);
+
 /*
  * Base64 encoder, local rather than mbedtls: the only thing needed is to
  * build the one header value to compare against, and this avoids tying the
@@ -76,6 +78,7 @@ static bool load(char *pass, size_t len)
 
 esp_err_t auth_init(void)
 {
+    devkey_load();
     char pass[64] = {0};
     if (load(pass, sizeof(pass))) {
         rebuild_expected(pass);
@@ -120,6 +123,74 @@ esp_err_t auth_set(const char *current, const char *next)
     }
     return err;
 }
+
+/* ------------------------------------------------------------ device key */
+
+static char s_devkey[65];
+
+static void devkey_load(void)
+{
+    nvs_handle_t h;
+    s_devkey[0] = '\0';
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t len = sizeof(s_devkey);
+        if (nvs_get_str(h, "dkey", s_devkey, &len) != ESP_OK) {
+            s_devkey[0] = '\0';
+        }
+        nvs_close(h);
+    }
+}
+
+esp_err_t auth_device_key_set(const char *key)
+{
+    size_t n = key ? strlen(key) : 0;
+    if (n < 16 || n > 64) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_str(h, "dkey", key);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err == ESP_OK) {
+        snprintf(s_devkey, sizeof(s_devkey), "%s", key);
+        ESP_LOGI(TAG, "device key updated");
+    }
+    return err;
+}
+
+bool auth_device_key_is_set(void)
+{
+    return s_devkey[0] != '\0';
+}
+
+bool auth_device_key_get(char *out, size_t n)
+{
+    snprintf(out, n, "%s", s_devkey);
+    return out[0] != '\0';
+}
+
+bool auth_device_check(httpd_req_t *r)
+{
+    char got[72] = {0};
+    if (s_devkey[0] &&
+        httpd_req_get_hdr_value_str(r, "X-Device-Key", got, sizeof(got)) == ESP_OK &&
+        same(got, s_devkey)) {
+        return true;
+    }
+    httpd_resp_set_status(r, "401 Unauthorized");
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_sendstr(r, s_devkey[0] ? "{\"error\":\"bad device key\"}"
+                                      : "{\"error\":\"no device key set on this box\"}");
+    return false;
+}
+
+/* ------------------------------------------------------------ admin gate */
 
 bool auth_check(httpd_req_t *r)
 {

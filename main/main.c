@@ -22,6 +22,10 @@
 #include "auth.h"
 #include "ota.h"
 #include "thermal.h"
+#include "sysdrive.h"
+#include "climate.h"
+#include "devlink.h"
+#include "news.h"
 
 static const char *TAG = "main";
 
@@ -52,6 +56,7 @@ void app_main(void)
              ota_running_version(), (int)esp_reset_reason());
 
     auth_init();
+    sysdrive_init();
     ESP_ERROR_CHECK(wifi_mgr_start());
 
     if (usbstore_start() != ESP_OK) {
@@ -59,6 +64,16 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(web_server_start());
+
+    if (climate_start() != ESP_OK) {
+        ESP_LOGE(TAG, "climate logger failed to start");
+    }
+    if (news_start() != ESP_OK) {
+        ESP_LOGE(TAG, "news cache failed to start");
+    }
+    if (devlink_start() != ESP_OK) {
+        ESP_LOGE(TAG, "ESP-NOW link to Desk-Disp failed to start");
+    }
 
     /* Last: its cool-down path uses every subsystem above. A dead sensor is
      * not fatal - the box just runs without thermal protection. */

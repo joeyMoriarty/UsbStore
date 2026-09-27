@@ -25,6 +25,11 @@
 #include "auth.h"
 #include "ota.h"
 #include "thermal.h"
+#include "sysdrive.h"
+#include "climate.h"
+#include "planner.h"
+#include "devlink.h"
+#include "news.h"
 
 static const char *TAG = "web";
 
@@ -120,6 +125,9 @@ static esp_err_t fail(httpd_req_t *r, int code, const char *msg)
     const char *status = "400 Bad Request";
     if (code == 404)      status = "404 Not Found";
     else if (code == 403) status = "403 Forbidden";
+    else if (code == 409) status = "409 Conflict";
+    else if (code == 413) status = "413 Payload Too Large";
+    else if (code == 428) status = "428 Precondition Required";
     else if (code == 500) status = "500 Internal Server Error";
     else if (code == 503) status = "503 Service Unavailable";
 
@@ -133,6 +141,25 @@ static esp_err_t fail(httpd_req_t *r, int code, const char *msg)
     httpd_resp_set_type(r, "application/json");
     httpd_resp_send(r, body, n);
     return ESP_OK;   /* handled: don't let httpd treat it as a socket error */
+}
+
+/* Pull one number field out of a flat JSON object - same deliberate limits
+ * as json_get_str(). */
+static bool json_get_num(const char *json, const char *key, double *out)
+{
+    char pat[40];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p || !(p = strchr(p + strlen(pat), ':'))) {
+        return false;
+    }
+    char *end;
+    double v = strtod(p + 1, &end);
+    if (end == p + 1) {
+        return false;
+    }
+    *out = v;
+    return true;
 }
 
 static esp_err_t ok_json(httpd_req_t *r)
@@ -269,9 +296,11 @@ typedef void (*xfer_fn_t)(httpd_req_t *r, char *buf);
 typedef struct {
     httpd_req_t *req;
     xfer_fn_t    fn;
+    bool         cpu;           /* compute-bound (charts, news...), not a transfer */
 } xfer_job_t;
 
 static QueueHandle_t s_jobs;
+static volatile int  s_busy;    /* workers mid-job */
 
 static void xfer_worker(void *arg)
 {
@@ -284,28 +313,48 @@ static void xfer_worker(void *arg)
         if (xQueueReceive(s_jobs, &job, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        /*
+         * Burst the CPU for compute-bound jobs, or when every worker is busy
+         * and more wait - overwhelmed. A lone download isn't worth it: the
+         * USB bus caps it at ~520 KB/s, so 240 MHz would only add heat.
+         */
+        int busy = __atomic_add_fetch(&s_busy, 1, __ATOMIC_RELAXED);
+        bool boost = job.cpu || (busy == XFER_WORKERS && uxQueueMessagesWaiting(s_jobs) > 0);
+        if (boost) {
+            thermal_boost_begin();
+        }
         if (buf) {
             job.fn(job.req, buf);
         } else {
             fail(job.req, 500, "out of memory");
         }
+        if (boost) {
+            thermal_boost_end();
+        }
+        __atomic_sub_fetch(&s_busy, 1, __ATOMIC_RELAXED);
         httpd_req_async_handler_complete(job.req);
     }
 }
 
-static esp_err_t hand_off(httpd_req_t *r, xfer_fn_t fn)
+static esp_err_t hand_off_job(httpd_req_t *r, xfer_fn_t fn, bool cpu)
 {
     httpd_req_t *copy = NULL;
     if (httpd_req_async_handler_begin(r, &copy) != ESP_OK) {
         return fail(r, 500, "out of memory");
     }
-    const xfer_job_t job = { .req = copy, .fn = fn };
+    const xfer_job_t job = { .req = copy, .fn = fn, .cpu = cpu };
     if (xQueueSend(s_jobs, &job, 0) != pdTRUE) {
         fail(copy, 503, "busy: too many transfers at once - try again shortly");
         drop_connection(copy);
         httpd_req_async_handler_complete(copy);
     }
     return ESP_OK;
+}
+
+/* Downloads and uploads: bus-bound, so no CPU burst of their own. */
+static esp_err_t hand_off(httpd_req_t *r, xfer_fn_t fn)
+{
+    return hand_off_job(r, fn, false);
 }
 
 /* ---------------------------------------------------------------- routes */
@@ -321,10 +370,7 @@ static esp_err_t h_favicon(httpd_req_t *r)
 
 static esp_err_t h_index(httpd_req_t *r)
 {
-    httpd_resp_set_type(r, "text/html");
-    httpd_resp_send(r, (const char *)index_html_start,
-                    index_html_end - index_html_start - 1);
-    return ESP_OK;
+    return web_send_page(r, index_html_start, index_html_end);
 }
 
 static esp_err_t h_status(httpd_req_t *r)
@@ -347,6 +393,21 @@ static esp_err_t h_status(httpd_req_t *r)
     else           snprintf(t_now, sizeof(t_now), "%.1f", tn);
     if (isnan(tp)) snprintf(t_peak, sizeof(t_peak), "null");
     else           snprintf(t_peak, sizeof(t_peak), "%.1f", tp);
+    char sys[40], sys_esc[88];
+    sysdrive_serial(sys, sizeof(sys));
+    json_esc(sys_esc, sizeof(sys_esc), sys);
+
+    char room[80] = "null";
+    float rt, rh;
+    uint32_t rage;
+    if (climate_latest(&rt, &rh, &rage)) {
+        snprintf(room, sizeof(room), "{\"t\":%.1f,\"h\":%.1f,\"age_s\":%lu}",
+                 rt, rh, (unsigned long)rage);
+    }
+
+    char link[200];
+    devlink_status_json(link, sizeof(link));
+
     therm_cooldown_t cd = thermal_last_cooldown();
     if (cd.valid) {
         snprintf(cool, sizeof(cool),
@@ -360,6 +421,8 @@ static esp_err_t h_status(httpd_req_t *r)
                      "\"version\":\"%s\",\"heap\":%u,\"uptime_s\":%lld,"
                      "\"temp_c\":%s,\"temp_peak_c\":%s,\"thermal\":\"%s\","
                      "\"therm_warm_c\":%.0f,\"therm_hot_c\":%.0f,\"cooldown\":%s,"
+                     "\"cpu_mhz\":%d,\"bursts\":%lu,"
+                     "\"devkey\":%s,\"sys_serial\":\"%s\",\"room\":%s,\"link\":%s,"
                      "\"drives\":[",
                      wifi_esc,
                      wifi_mgr_is_station() ? "true" : "false",
@@ -368,7 +431,9 @@ static esp_err_t h_status(httpd_req_t *r)
                      (unsigned)esp_get_free_heap_size(),
                      (long long)(esp_timer_get_time() / 1000000),
                      t_now, t_peak, thermal_state_name(),
-                     THERM_WARM_C, THERM_HOT_C, cool);
+                     THERM_WARM_C, THERM_HOT_C, cool,
+                     thermal_cpu_mhz(), (unsigned long)thermal_bursts(),
+                     auth_device_key_is_set() ? "true" : "false", sys_esc, room, link);
 
     /* 512 of headroom: one entry with an escaped name and note is ~350
      * bytes, and a truncated snprintf would push `o` past the buffer. */
@@ -376,11 +441,15 @@ static esp_err_t h_status(httpd_req_t *r)
         char name[96], note[112];
         json_esc(name, sizeof(name), d[i].product);
         json_esc(note, sizeof(note), d[i].note);
+        char serial[88];
+        json_esc(serial, sizeof(serial), d[i].serial);
+        bool is_sys = sys[0] && !strcmp(sys, d[i].serial);
         o += snprintf(s_buf + o, XFER_SZ - o,
                       "%s{\"path\":\"%s\",\"name\":\"%s\",\"bytes\":%llu,"
-                      "\"state\":\"%s\",\"note\":\"%s\"}",
+                      "\"state\":\"%s\",\"note\":\"%s\",\"serial\":\"%s\",\"system\":%s}",
                       i ? "," : "", d[i].base, name,
-                      (unsigned long long)d[i].capacity, d[i].state, note);
+                      (unsigned long long)d[i].capacity, d[i].state, note,
+                      serial, is_sys ? "true" : "false");
     }
     /* Everything on the bus, hub included: the diagnostic view. */
     usbstore_usbdev_t u[USBSTORE_MAX_BUS];
@@ -410,6 +479,11 @@ static esp_err_t h_list(httpd_req_t *r)
     }
     if (!usbstore_path_ok(path)) {
         return fail(r, 403, "path outside a mounted drive");
+    }
+    /* The planner's private files live in a usbstore folder; browsing it
+     * must not be a way round the planner's password. */
+    if (sysdrive_is_protected(path) && !auth_check(r)) {
+        return ESP_OK;
     }
     usbstore_ref_t ref;
     if (!open_drive(r, path, &ref)) {
@@ -550,6 +624,13 @@ static void do_download(httpd_req_t *r, char *buf)
 
 static esp_err_t h_download(httpd_req_t *r)
 {
+    /* Checked here, on the web task, so the browser's login prompt comes from
+     * a plain request before any worker is tied up. */
+    char path[512];
+    if (get_param(r, "p", path, sizeof(path)) && sysdrive_is_protected(path) &&
+        !auth_check(r)) {
+        return ESP_OK;
+    }
     return hand_off(r, do_download);
 }
 
@@ -565,6 +646,11 @@ static void do_upload(httpd_req_t *r, char *buf)
     }
     if (!usbstore_path_ok(path)) {
         fail(r, 403, "path outside a mounted drive");
+        drop_connection(r);
+        return;
+    }
+    if (sysdrive_is_protected(path)) {
+        fail(r, 403, "that folder is managed by UsbStore - use the Climate or Planner pages");
         drop_connection(r);
         return;
     }
@@ -645,6 +731,9 @@ static esp_err_t h_delete(httpd_req_t *r)
     if (!usbstore_path_ok(path)) {
         return fail(r, 403, "path outside a mounted drive");
     }
+    if (sysdrive_is_protected(path)) {
+        return fail(r, 403, "that folder is managed by UsbStore - use the Climate or Planner pages");
+    }
     usbstore_ref_t ref;
     if (!open_drive(r, path, &ref)) {
         return ESP_OK;
@@ -677,6 +766,9 @@ static esp_err_t h_mkdir(httpd_req_t *r)
     }
     if (!usbstore_path_ok(path)) {
         return fail(r, 403, "path outside a mounted drive");
+    }
+    if (sysdrive_is_protected(path)) {
+        return fail(r, 403, "that folder is managed by UsbStore");
     }
     usbstore_ref_t ref;
     if (!open_drive(r, path, &ref)) {
@@ -835,6 +927,26 @@ static esp_err_t h_thermal_test(httpd_req_t *r)
 }
 
 /* Set or change the admin password. auth_set() checks the current one. */
+/* Set the device key other gadgets (Desk-Disp) use. Admin only; the key is
+ * never sent back out - the device that needs it gets it from its own
+ * firmware config. */
+static esp_err_t h_devicekey(httpd_req_t *r)
+{
+    if (!auth_check(r)) {
+        return ESP_OK;
+    }
+    char body[160], key[72] = {0};
+    if (!read_small_body(r, body, sizeof(body)) ||
+        !json_get_str(body, "key", key, sizeof(key))) {
+        return fail(r, 400, "missing key");
+    }
+    esp_err_t err = auth_device_key_set(key);
+    if (err == ESP_ERR_INVALID_ARG) {
+        return fail(r, 400, "device key must be 16-64 characters");
+    }
+    return err == ESP_OK ? ok_json(r) : fail(r, 500, "could not save");
+}
+
 static esp_err_t h_passwd(httpd_req_t *r)
 {
     char body[256];
@@ -901,6 +1013,40 @@ static esp_err_t h_provision(httpd_req_t *r)
 
 /* ------------------------------------------------------------------ start */
 
+/* ----------------------------------------- exported for the page modules */
+
+esp_err_t web_fail(httpd_req_t *r, int code, const char *msg) { return fail(r, code, msg); }
+esp_err_t web_ok(httpd_req_t *r) { return ok_json(r); }
+bool web_param(httpd_req_t *r, const char *key, char *out, size_t len)
+{
+    return get_param(r, key, out, len);
+}
+bool web_small_body(httpd_req_t *r, char *body, size_t cap)
+{
+    return read_small_body(r, body, cap);
+}
+void web_json_esc(char *out, size_t n, const char *in) { json_esc(out, n, in); }
+bool web_json_str(const char *json, const char *key, char *out, size_t n)
+{
+    return json_get_str(json, key, out, n);
+}
+bool web_json_num(const char *json, const char *key, double *out)
+{
+    return json_get_num(json, key, out);
+}
+esp_err_t web_hand_off(httpd_req_t *r, web_job_fn fn) { return hand_off_job(r, fn, true); }
+void web_drop_connection(httpd_req_t *r) { drop_connection(r); }
+
+esp_err_t web_send_page(httpd_req_t *r, const uint8_t *start, const uint8_t *end)
+{
+    /* The pages change with every firmware update; a cached copy of an old
+     * page against a new API is a broken page. no-cache = always revalidate. */
+    httpd_resp_set_type(r, "text/html");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-cache");
+    httpd_resp_send(r, (const char *)start, end - start - 1);
+    return ESP_OK;
+}
+
 esp_err_t web_server_start(void)
 {
     /* PSRAM is fine for a streaming buffer and keeps internal RAM for WiFi. */
@@ -924,7 +1070,7 @@ esp_err_t web_server_start(void)
     }
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers  = 20;
+    cfg.max_uri_handlers  = 32;
     cfg.stack_size        = 8192;
     cfg.lru_purge_enable  = true;
     /* Transfers now overlap with page traffic, so allow more connections.
@@ -944,6 +1090,7 @@ esp_err_t web_server_start(void)
 
     static const httpd_uri_t routes[] = {
         { .uri = "/",             .method = HTTP_GET,  .handler = h_index       },
+        { .uri = "/system",       .method = HTTP_GET,  .handler = h_index       },
         { .uri = "/favicon.ico",  .method = HTTP_GET,  .handler = h_favicon     },
         { .uri = "/api/status",   .method = HTTP_GET,  .handler = h_status      },
         { .uri = "/api/list",     .method = HTTP_GET,  .handler = h_list        },
@@ -959,10 +1106,15 @@ esp_err_t web_server_start(void)
         { .uri = "/api/passwd",   .method = HTTP_POST, .handler = h_passwd      },
         { .uri = "/api/ota",      .method = HTTP_POST, .handler = ota_http_handler },
         { .uri = "/api/thermaltest", .method = HTTP_POST, .handler = h_thermal_test },
+        { .uri = "/api/devicekey", .method = HTTP_POST, .handler = h_devicekey },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
         ESP_ERROR_CHECK(httpd_register_uri_handler(srv, &routes[i]));
     }
+    sysdrive_routes(srv);
+    climate_routes(srv);
+    planner_routes(srv);
+    news_routes(srv);
 
     ESP_LOGI(TAG, "http server up on port 80");
     return ESP_OK;

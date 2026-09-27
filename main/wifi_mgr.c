@@ -10,6 +10,7 @@
 #include "esp_netif.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
+#include "esp_netif_sntp.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "mdns.h"
@@ -182,6 +183,14 @@ esp_err_t wifi_mgr_start(void)
             s_station = true;
             netlog_set_network_ready(true);
             ESP_LOGI(TAG, "joined \"%s\" as %s", ssid, s_ip);
+
+            /* Internet time, for timestamping climate readings. Runs in the
+             * background and re-syncs by itself; readings are refused until
+             * the clock is set rather than logged as 1970. */
+            esp_sntp_config_t sntp = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+            if (esp_netif_sntp_init(&sntp) != ESP_OK) {
+                ESP_LOGW(TAG, "SNTP did not start - climate logging will wait");
+            }
         } else {
             ESP_LOGW(TAG, "could not join \"%s\"", ssid);
             esp_wifi_stop();

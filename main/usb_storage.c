@@ -262,6 +262,7 @@ static void census_add(uint8_t addr)
     if (usb_host_device_info(h, &info) == ESP_OK) {
         snprintf(d.speed, sizeof(d.speed), "%s", speed_name(info.speed));
         str_desc_ascii(info.str_desc_product, d.product, sizeof(d.product));
+        str_desc_ascii(info.str_desc_serial_num, d.serial, sizeof(d.serial));
     }
     snprintf(d.kind, sizeof(d.kind), "%s", class_name(d.cls));
 
@@ -342,6 +343,21 @@ int usbstore_census(usbstore_usbdev_t *out, int max)
     }
     portEXIT_CRITICAL(&s_census_mux);
     return n;
+}
+
+static bool census_serial(uint8_t addr, char *out, size_t cap)
+{
+    bool found = false;
+    portENTER_CRITICAL(&s_census_mux);
+    for (int i = 0; i < USBSTORE_MAX_BUS; i++) {
+        if (s_census[i].used && s_census[i].info.addr == addr && s_census[i].info.serial[0]) {
+            snprintf(out, cap, "%s", s_census[i].info.serial);
+            found = true;
+            break;
+        }
+    }
+    portEXIT_CRITICAL(&s_census_mux);
+    return found;
 }
 
 static bool census_product(uint8_t addr, char *out, size_t cap)
@@ -708,9 +724,47 @@ bool usbstore_path_ok(const char *path)
     if (strstr(path, "..")) {
         return false;
     }
+    /*
+     * Canonical form only. FatFs treats '\' as a separator and collapses
+     * repeated slashes, so "/usb0//usbstore" or "/usb0/usbstore\planner"
+     * would reach the same folder by a spelling that a prefix check on
+     * "/usb0/usbstore/" misses. Refusing the odd spellings outright keeps
+     * every later prefix check honest.
+     */
+    size_t len = strlen(path);
+    if (strchr(path, '\\') || strstr(path, "//") || strstr(path, "/./") ||
+        (len >= 2 && strcmp(path + len - 2, "/.") == 0) ||
+        (len > 1 && path[len - 1] == '/')) {
+        return false;
+    }
     /* Lock-free: a cheap early reject only. usbstore_acquire() re-checks
      * under the lock, so a drive vanishing in between is still caught. */
     return slot_for_path(path) != NULL;
+}
+
+bool usbstore_base_for_serial(const char *serial, char *base, size_t len)
+{
+    if (!serial || !serial[0]) {
+        return false;
+    }
+    char sn[40];
+    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
+        const slot_t *s = &s_slot[i];
+        if (s->st == ST_EMPTY || s->gone) {
+            continue;
+        }
+        if (census_serial(s->addr, sn, sizeof(sn)) && strcmp(sn, serial) == 0) {
+            snprintf(base, len, "%s", s->base);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool usbstore_serial_for_path(const char *path, char *serial, size_t len)
+{
+    const slot_t *s = slot_for_path(path);
+    return s && census_serial(s->addr, serial, len);
 }
 
 /*
@@ -739,6 +793,7 @@ int usbstore_list(usbstore_drive_t *out, int max)
         } else if (!census_product(s->addr, d->product, sizeof(d->product))) {
             snprintf(d->product, sizeof(d->product), "USB drive");
         }
+        census_serial(s->addr, d->serial, sizeof(d->serial));
     }
     return n;
 }

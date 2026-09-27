@@ -47,6 +47,12 @@
          font-size:13px;color:var(--muted);word-break:break-all}
   .pill{display:inline-block;font-size:12px;padding:2px 8px;border-radius:99px;
         border:1px solid var(--line);color:var(--muted);margin-right:6px}
+  nav{display:flex;gap:4px;margin-bottom:14px;flex-wrap:wrap}
+  nav a{color:var(--muted);text-decoration:none;padding:6px 12px;border-radius:7px;
+        border:1px solid transparent;font-size:14px}
+  nav a.on{color:var(--fg);border-color:var(--line);background:var(--panel)}
+  select{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:7px;
+         background:var(--bg);color:var(--fg)}
   .pill.ok{color:var(--ok);border-color:var(--ok)}
   .pill.warm{color:#b7791f;border-color:#b7791f}
   .pill.hot{color:var(--danger);border-color:var(--danger)}
@@ -68,6 +74,8 @@
   .bar i{display:block;height:100%;background:var(--accent);width:0}
   .empty{color:var(--muted);font-size:14px;padding:18px 4px;text-align:center}
   .hint{font-size:12px;color:var(--muted);margin-top:8px}
+  /* One page, two views: / is Files, /system is System. */
+  body[data-view="files"] .v-system, body[data-view="system"] .v-files{display:none!important}
   pre.log{margin:10px 0 0;padding:10px;background:var(--bg);color:var(--fg);
           border:1px solid var(--line);border-radius:7px;height:240px;
           overflow:auto;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
@@ -75,8 +83,10 @@
 </style>
 </head>
 <body>
+<script>document.body.dataset.view = location.pathname.startsWith('/system') ? 'system' : 'files';</script>
 <div class="wrap">
-  <h1>UsbStore<span class="pill" id="temp" title="Chip die temperature">chip –</span></h1>
+  <nav><a href="/" class="v-files on">Files</a><a href="/" class="v-system">Files</a><a href="/climate">Climate</a><a href="/planner">Planner</a><a href="/news">News</a><a href="/system" class="v-files">System</a><a href="/system" class="v-system on">System</a></nav>
+  <h1><span class="v-files">UsbStore</span><span class="v-system">System</span><span class="pill" id="temp" title="Chip die temperature">chip –</span></h1>
   <div class="sub" id="sub">connecting…</div>
 
   <!-- Shown only when running from the setup AP -->
@@ -120,7 +130,31 @@
     </div>
   </div>
 
-  <div class="card" id="browser" style="display:none">
+  <div class="card v-system">
+    <strong>System drive</strong>
+    <div class="hint" id="sysInfo" style="margin-top:4px">–</div>
+    <div class="row" style="margin-top:10px">
+      <select id="sysPick" class="grow"></select>
+      <button id="sysUse">Use as system drive</button>
+    </div>
+    <div class="hint">Climate logs and the planner are stored in a <code>usbstore</code> folder
+      on this drive. It's recognised by its serial number, so it's found again
+      whichever port it's in. That folder is hidden from the file browser's
+      delete and upload, and needs the password to open.</div>
+    <div class="msg" id="sysMsg"></div>
+
+    <strong style="display:block;margin-top:16px">Device key</strong>
+    <div class="hint">Lets Desk-Disp post room readings and read your next tasks —
+      nothing else. Status: <b id="devkeyState">–</b></div>
+    <div class="row" style="margin-top:8px">
+      <input id="devkey" class="grow" placeholder="16–64 characters, same as in Desk-Disp's secrets.h">
+      <button id="devkeySave">Save key</button>
+    </div>
+    <div class="msg" id="keyMsg"></div>
+    <div class="hint" id="linkInfo"></div>
+  </div>
+
+  <div class="card v-files" id="browser" style="display:none">
     <!-- One tab per mounted drive; the only way to reach /usb1 and beyond. -->
     <div class="tabs" id="tabs"></div>
     <div class="row">
@@ -145,7 +179,7 @@
       ESP32-S3's USB bus, not the network. Large files take a while.</div>
   </div>
 
-  <div class="card">
+  <div class="card v-system">
     <div class="row">
       <strong class="grow">Console</strong>
       <button id="logPause">Pause</button>
@@ -158,7 +192,7 @@
       reported in the banner above after the reboot.</div>
   </div>
 
-  <div class="card">
+  <div class="card v-system">
     <div class="row">
       <strong class="grow">Chip health</strong>
       <span class="pill" id="thermState">–</span>
@@ -175,7 +209,7 @@
       about a minute and then restarts.</div>
   </div>
 
-  <div class="card">
+  <div class="card v-system">
     <div class="row">
       <strong class="grow">Firmware</strong>
       <span class="pill" id="ver">–</span>
@@ -254,7 +288,8 @@ async function status() {
     const usb = s.usb || [];
     $('drives').innerHTML = (drives.length
       ? drives.map(d => `<span class="pill">${esc(d.path)} · ${esc(d.name)} · ${
-          d.state === 'failed' ? esc(d.note) : d.state === 'parked' ? 'parked' : fmt(d.bytes)}</span>`).join('')
+          d.state === 'failed' ? esc(d.note) : d.state === 'parked' ? 'parked' : fmt(d.bytes)}${
+          d.system ? ' · <b>system</b>' : ''}</span>`).join('')
         + (drives.length > 2
           ? '<div class="hint">More than two drives: the S3 can keep only one open at a time. Switching to a parked drive takes a moment.</div>'
           : '')
@@ -264,6 +299,7 @@ async function status() {
         : 'nothing detected — no signal is reaching the S3 (cable, adapter or hub power)')
       + '</div>';
 
+    renderSystem(s);
     $('browser').style.display = drives.length ? 'block' : 'none';
 
     // Only re-list when the drive under us changed. Re-reading the folder on
@@ -486,6 +522,70 @@ async function crashCheck() {
   } catch (e) {}
 }
 
+/* ---- system drive + device key -------------------------------------- */
+let sysPickKey = '';
+
+function renderSystem(s) {
+  const drives = s.drives || [];
+  const sys = drives.find(d => d.system);
+  $('sysInfo').textContent = sys
+    ? `${sys.name} (${sys.path}) — climate logs and the planner are on it.`
+    : s.sys_serial
+      ? 'Chosen, but not plugged in right now. Climate readings wait in memory until it\'s back.'
+      : 'None chosen yet. Pick a drive to turn on climate logging and the planner.';
+
+  // Rebuild the picker only when the drives change, so the 15 s refresh
+  // doesn't throw away what you just selected.
+  const key = drives.map(d => d.path + d.serial + d.system).join('|');
+  if (key !== sysPickKey) {
+    sysPickKey = key;
+    const sel = $('sysPick');
+    sel.textContent = '';
+    for (const d of drives) {
+      const o = document.createElement('option');
+      o.value = d.path;
+      o.disabled = !d.serial;
+      o.textContent = `${d.name} (${d.path})` + (d.system ? ' — current' : '') + (d.serial ? '' : ' — no serial number, can\'t be used');
+      sel.appendChild(o);
+    }
+    $('sysUse').disabled = !drives.some(d => d.serial);
+  }
+  $('devkeyState').textContent = s.devkey ? 'set' : 'not set';
+
+  const l = s.link;
+  $('linkInfo').textContent = !l || !l.on
+    ? 'Desk-Disp link: off (the box is not on a WiFi network).'
+    : l.age_s < 0
+      ? `Desk-Disp link: listening on WiFi channel ${l.ch}, nothing heard since boot.`
+      : `Desk-Disp link (ESP-NOW, channel ${l.ch}): last heard ${l.age_s} s ago · ` +
+        `${l.hellos} packets · ${l.bad} rejected · ${l.tasks} upcoming task(s) cached.`;
+}
+
+$('sysUse').onclick = async () => {
+  const p = $('sysPick').value;
+  if (!p) return;
+  if (!confirm(`Use ${p} as the system drive? Climate logs and the planner will be stored on it.`)) return;
+  if (!(await ensureAuth())) { note($('sysMsg'), 'password required', 'err'); return; }
+  try {
+    await api('/api/sysdrive?p=' + encodeURIComponent(p), { method: 'POST' });
+    note($('sysMsg'), 'System drive set.', 'good');
+    sysPickKey = '';
+    status();
+  } catch (e) { note($('sysMsg'), e.message, 'err'); }
+};
+
+$('devkeySave').onclick = async () => {
+  const key = $('devkey').value.trim();
+  if (key.length < 16 || key.length > 64) { note($('keyMsg'), 'The key must be 16–64 characters.', 'err'); return; }
+  if (!(await ensureAuth())) { note($('keyMsg'), 'password required', 'err'); return; }
+  try {
+    await api('/api/devicekey', { method: 'POST', body: JSON.stringify({ key }) });
+    $('devkey').value = '';
+    note($('keyMsg'), 'Device key saved.', 'good');
+    status();
+  } catch (e) { note($('keyMsg'), e.message, 'err'); }
+};
+
 /* ---- chip temperature ----------------------------------------------- */
 const fmtC = c => c == null ? '–' : c.toFixed(1) + ' °C';
 let coolShown = false;
@@ -499,6 +599,8 @@ function renderThermal(s) {
   $('thermState').className = 'pill ' + cls;
   $('thermInfo').textContent =
     `Now ${fmtC(s.temp_c)}, peak since boot ${fmtC(s.temp_peak_c)}. ` +
+    (s.cpu_mhz ? `CPU ${s.cpu_mhz} MHz; ${s.bursts} burst${s.bursts === 1 ? '' : 's'} to 240 MHz since boot ` +
+                 `(for heavy work, up to 20 s at a time, only below 65 °C). ` : '') +
     `At ${s.therm_warm_c} °C it throttles (CPU 80 MHz, WiFi power save) and stays online; ` +
     `at ${s.therm_hot_c} °C it unmounts the drives and sleeps until cool.`;
 
@@ -598,11 +700,12 @@ $('otaFile').onchange = async () => {
   xhr.send(f);
 };
 
+const SYSTEM_VIEW = document.body.dataset.view === 'system';
 status();
 crashCheck();
-pollLog();
+if (SYSTEM_VIEW) pollLog();
 setInterval(() => { if (document.visibilityState === 'visible') status(); }, 15000);
-setInterval(() => { if (document.visibilityState === 'visible') pollLog(); }, 1000);
+setInterval(() => { if (SYSTEM_VIEW && document.visibilityState === 'visible') pollLog(); }, 1000);
 </script>
 </body>
 </html>

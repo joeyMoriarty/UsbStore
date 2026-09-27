@@ -68,6 +68,20 @@ one of these. This project gets past all of them, and documents how:
 - **Admin password** protecting every write action and firmware updates
 - Debugging with no serial adapter: live log, UDP log broadcast, crash dumps to
   flash, and a **USB bus census** listing every device the S3 can see
+- A **system drive**, found by its USB serial number, holding the box's own
+  data in a protected `usbstore/` folder
+- **Climate** pages: room temperature and humidity, outdoor weather with a
+  forecast, and the sun and moon — logged for 92 days, charted by day, week
+  and month
+- **Planner**: notes, a repeating schedule, and tables with CSV import/export
+- A signed, encrypted **ESP-NOW link** to a companion ESP32 display, which
+  works even on networks that stop WiFi devices talking to each other
+
+- **News**: the full stories behind a companion display's headlines, with a
+  small linked source under each
+- **CPU bursts**: up to 240 MHz for heavy work, from a cool chip, 20 s at a time
+
+The web UI has five tabs: **Files · Climate · Planner · News · System**.
 
 ## Measured performance
 
@@ -240,6 +254,133 @@ when nothing else is open, and when two are open the less recently used one is
 parked after 15 s idle. If you plug a drive in within 15 s of using two others
 and it doesn't appear, unplug and replug it.
 
+## The system drive
+
+One pendrive can be chosen, on the **System** page, as the box's own storage.
+It's remembered by its **USB serial number**, so it's found again whichever
+port it's in and whatever `/usbN` number it gets. Everything the box keeps goes
+in one folder on it:
+
+```
+usbstore/
+├── planner/      notes.json · events.json · tables.json · upcoming.json
+└── climate/
+    ├── raw/  hourly/                  room: one CSV per day, then 24-line summaries
+    ├── outdoor/raw/  outdoor/hourly/  weather
+    ├── sky/raw/  sky/hourly/          sun and moon
+    ├── days/                          sunrise, sunset, moonrise, moonset, phase per day
+    └── forecast/                      each new forecast
+```
+
+The file browser shows the folder but refuses uploads, deletes and new folders
+inside it, and opening it needs the admin password. (It's called `usbstore`
+because that's exactly eight characters: FAT gives longer names a second, short
+"8.3" alias like `USBSTO~1`, which would be a way around a name-based check.)
+
+**It's tiny.** Plain CSV and JSON, one file per day per kind: about 90 KB a day
+with everything logging, **~8 MB for the 92 days kept — 0.2% of a 4 GB
+pendrive.** Plug the drive into a PC and every file opens in Excel or a text
+editor.
+
+## Climate
+
+Three sections, each charted over a day (5-minute points), a week (hourly) or
+a month (3-hourly), with the shaded band showing each period's low to high:
+
+| Section | Logged | Source |
+|---|---|---|
+| **Room** | temperature, humidity, every minute | a companion ESP32 with an AHT10 sensor |
+| **Outdoor** | temperature, feels-like, humidity, wind, cloud, rain, pressure, every 5 min; a 3-day forecast | Open-Meteo, fetched by the companion's PC helper |
+| **Sun & Moon** | altitude and bearing of both, every 2 min; the moon's phase; sunrise, sunset, moonrise, moonset per day | computed on the PC helper |
+
+The Sun & Moon section draws a south-facing horizon with today's traced paths,
+the moon in its current phase, and — for a week or a month — sunrise, sunset
+and daylight trends.
+
+Readings are buffered in RAM and written in batches every 10 minutes, so the
+system drive is touched six times an hour rather than sixty — with
+park-and-swap, each touch may mean swapping it in. A finished day is summarised
+into 24 hourly lines, so a month's chart reads 30 small files, not 43,000
+lines. Files older than 92 days are deleted by name. Nothing is logged until
+the box has internet time, rather than stamping readings as 1970.
+
+## Planner
+
+**Notes**, a **Schedule** (agenda and month views; repeats daily, weekly,
+monthly or yearly, with an end date; a done tick for one-off events) and
+**Tables** (a grid editor with CSV import and export). Everything needs the
+admin password — to read as well as write.
+
+- **The firmware never parses the documents.** Each is an opaque JSON blob the
+  browser loads, edits and saves whole; repeats, calendars and CSV are all
+  JavaScript in the page. The C side is ~300 lines and can't be confused by odd
+  content.
+- **Autosave, without losing edits to another tab.** Each document has a
+  version tag (an FNV-1a hash, sent as an `ETag`). A save must quote the tag it
+  started from in `If-Match`; if the file changed meanwhile, the box answers
+  `409 Conflict` and the page asks you to reload instead of overwriting.
+- **Crash-safe saves on FAT.** Write `x.json.tmp`, move the old file to
+  `x.json.bak`, rename `.tmp` into place. FAT can't rename over a file in one
+  step, so there's an instant with no `x.json` — and the next access repairs
+  it from `.tmp` or `.bak`.
+- **CSV in the browser.** Export quotes cells containing commas, quotes or line
+  breaks (quotes doubled, RFC 4180) and downloads a `Blob`; import parses the
+  same rules. Tables round-trip through Excel or Google Sheets.
+- **The schedule for other gadgets.** On every schedule save the page also
+  writes `upcoming.json` — the next 30 occurrences within 90 days, repeats
+  already expanded — so a small device can show "what's next" without
+  understanding repeat rules.
+
+## News
+
+The companion display's PC helper reads a dozen RSS feeds (world, India,
+economy, tech, local). The display itself only has room for short headlines,
+so the **News** page shows the full stories: title, summary, how long ago, and
+a small source line linking to the original article. The box fetches them from
+the PC over plain HTTP (the display tells it where the PC is), keeps the last
+copy in RAM, and serves that — marked with its age — when the PC is off. Feed
+text is only ever inserted as text, and only `http(s)` links are made
+clickable: an RSS feed is someone else's content.
+
+## Talking to other gadgets
+
+A second, narrow credential — the **device key**, set on the System page —
+lets another device post room readings and read the upcoming tasks, and
+nothing else. It never holds the admin password, which could reflash the box.
+
+Over HTTP it's an `X-Device-Key` header (`POST /api/climate/ingest`,
+`GET /api/planner?doc=upcoming`). But many networks — campus, office, guest
+WiFi — turn on **client isolation**: the access point refuses to pass traffic
+between its own WiFi clients, so two boards that both reach the internet can't
+reach each other. (Both reachable from a wired PC, neither from the other, mDNS
+dead: that's the signature.)
+
+So the box also speaks **ESP-NOW**: frames go radio to radio on the channel
+both boards already share with the access point, and the router never sees
+them. Once a minute the companion broadcasts a 134-byte HELLO (room reading,
+sun, moon, weather, forecast, and where its PC helper is); the box logs it and
+answers with a 230-byte reply carrying the next four tasks.
+
+The same isolation stops **phones** on that WiFi from opening the box. The
+companion's PC helper includes a small relay for that: a phone opens
+`http://<PC>:8080/` and every request is passed through to the box, uploads
+and the password prompt included.
+
+- **Signed and encrypted.** ESP-NOW isn't covered by the WiFi password. Keys for
+  signing and encrypting are derived from the device key with HMAC-SHA256;
+  every packet carries a signature, the task list is encrypted with an
+  HMAC-counter-mode keystream, replies must echo the requester's random nonce,
+  and readings only count if the sender's clock is within 5 minutes.
+- **Radios that sleep.** The box listens 25 ms in every 100 (the ESP-NOW
+  default keeps the radio on permanently — more heat); the companion repeats
+  its HELLO every 60 ms until answered, and a repeat gets the same reply
+  rather than a second log entry.
+- **Never touches the drive.** The task list is parsed into RAM when the
+  planner saves it, so the minute-by-minute traffic can't cause a swap.
+
+The System page shows the link's WiFi channel, when it last heard from the
+companion, and how many packets it rejected.
+
 ## Thermal protection
 
 The web page shows the chip's temperature, and the firmware acts on it:
@@ -255,6 +396,16 @@ can't see the voltage regulator, which is the hottest part of the board — but
 throttling cuts the current the regulator has to carry, so it cools that too.
 For protection keyed to the regulator itself, a thermistor taped to it is on
 the roadmap.
+
+**CPU bursts.** The clock normally runs at 160 MHz. While compute-heavy work
+is running — building a month's chart, the sun and moon summary, the news, a
+planner document — or when both transfer workers are busy and more requests
+are queued, it bursts to **240 MHz** (the S3's clock comes in 80/160/240 MHz
+steps; there is no 200). A burst only starts below 65 °C, lasts at most 20 s,
+and is followed by at least 20 s at the normal clock; throttling always wins.
+A plain download doesn't burst: it's limited by the USB bus, so a faster CPU
+would only add heat. The System page shows the clock and how many bursts
+there have been.
 
 **Test it without heating anything:** *Chip health → Test cool-down* runs the
 real 85 °C sequence for 30 s. Measured on the tested board: **30 s of light
@@ -334,6 +485,12 @@ adapter: hold its `EN` pin to `GND`, wire the S3's **GPIO 43** to the DevKit's
 - File and drive names are HTML-escaped in the UI: they come from whoever wrote
   the pendrive, and an unescaped crafted filename could otherwise run script in
   your browser while the admin password is cached.
+- **The planner is private**: reading it needs the admin password too. The
+  `usbstore/` folder needs the password to open and can't be written through
+  the file browser at all.
+- The **device key** can post room readings and read the upcoming tasks —
+  nothing else. Over ESP-NOW it's never sent; it only keys the signatures and
+  the encryption.
 
 ## HTTP API
 
@@ -351,8 +508,18 @@ adapter: hold its `EN` pin to `GND`, wire the S3's **GPIO 43** to the DevKit's
 | POST | `/api/thermaltest` | ✔ | run the cool-down sequence for 30 s |
 | POST | `/api/wifi` | ✔* | set WiFi (+ first admin password) |
 | POST | `/api/passwd` | current pw | set or change the admin password |
+| POST | `/api/sysdrive?p=/usb0` | ✔ | choose the system drive (empty `p` clears it) |
+| POST | `/api/devicekey` | ✔ | set the device key: `{"key": "..."}` |
+| GET | `/api/climate?series=room\|outdoor\|sky&range=day\|week\|month` | — | chart data: `[epoch, min, avg, max, …]` per field |
+| GET | `/api/sky` | — | latest sun, moon, weather, forecast, and a line per day |
+| GET | `/api/news[?refresh=1]` | — | the full news, with its age and whether the PC answered |
+| POST | `/api/climate/ingest` | device key | a room reading: `{"t": 24.5, "h": 55}` |
+| GET | `/api/planner?doc=notes\|events\|tables\|upcoming` | ✔ (upcoming: or device key) | a planner document, with its `ETag` |
+| POST | `/api/planner?doc=…` | ✔ + `If-Match` | save it whole; `409` if it changed meanwhile |
 
 \* Open only until an admin password exists.
+
+Pages: `/` (Files), `/climate`, `/planner`, `/news`, `/system`.
 
 ## How it works: tips and tricks
 
@@ -526,12 +693,61 @@ If the router drops the connection, the board reconnects on its own, waiting
 `esp_timer`, because blocking inside the WiFi event handler would stall every
 other event.
 
+### 16. When the network won't let two boards talk, go under it
+
+Client isolation made every HTTP connection between two ESP32s on the same
+WiFi fail. ESP-NOW doesn't go through the access point at all. Two things make
+it work alongside normal WiFi: both boards must be on the access point's
+channel (add peers with channel `0`, "wherever I am now"), and because sleeping
+radios miss frames, the receiver needs a wake window and the sender needs to
+repeat until answered.
+
+### 17. Version and size-check anything that crosses a wire
+
+The link's packets are packed C structs duplicated in two codebases. Each side
+`static_assert`s every struct's size, and the header carries a version byte:
+when the HELLO grew from 33 to 128 bytes, old firmware ignored the new packets
+instead of misreading them.
+
+### 18. Let the browser own the document
+
+The planner's notes, schedule and tables are blobs the firmware stores but
+never parses — the page does all the logic. The one exception, the upcoming
+list, is written by the page in the flattest possible form precisely so that
+a few dozen lines of C can read it.
+
+### 19. Optimistic locking in two headers
+
+`ETag` out, `If-Match` back, `409` on a mismatch: that's the whole of "two
+tabs can't overwrite each other", and it costs one hash per save.
+
+### 20. HMAC is two hashes
+
+mbedTLS 4 (in ESP-IDF 6.1) made its HMAC functions private. RFC 2104's HMAC is
+`H((K ⊕ opad) ‖ H((K ⊕ ipad) ‖ m))`, so it's rebuilt from the public SHA-256
+calls — and checked against RFC 4231's published test vector at every boot, so
+a mistake can't hide.
+
+### 21. Burst, don't overclock
+
+240 MHz all the time would add heat for nothing — transfers are bus-bound. So
+the clock goes up only while compute-heavy work runs, for at most 20 s, then
+rests. One lock owns every clock change, so a burst on a web worker can never
+undo a thermal throttle from another task.
+
+### 22. One engine, many series
+
+Room, outdoor and sky logging share every line of buffering, file writing,
+hourly rollup, pruning and charting; they differ only in a row of a table
+(name, folder, field count, minimum gap). Adding a sensor is adding a row.
+
 ## Roadmap: toward a pendrive RAID
 
 The groundwork is here: several drives at once, per-drive volumes, hot-plug,
 and park-and-swap. What's next, in order of usefulness:
 
-1. **Stable drive identity.** Mount by USB serial number or volume label
+1. **Stable drive identity.** Started: the system drive is already found by its
+   USB serial number. Next, mount *every* drive by serial or volume label
    instead of plug order, so `/usb0` is always the same stick. Every RAID mode
    below needs to know which physical drive is which.
 2. **RAID 1 — mirroring (the valuable one).** Write every file to two
@@ -585,7 +801,15 @@ two masters on one FAT table corrupts it).
 | `main/auth.c` | admin password (NVS), Basic auth gate |
 | `main/ota.c` | firmware upload, image checks, rollback confirmation |
 | `main/netlog.c` | log ring buffer, UDP broadcast |
-| `main/www/index.html` | the web UI, embedded into flash |
+| `main/sysdrive.c` | the system drive: chosen by serial, protected `usbstore/` folder |
+| `main/climate.c` | room / outdoor / sky logging, rollups, pruning, chart and sky APIs |
+| `main/planner.c` | planner documents: ETag, If-Match, crash-safe saves |
+| `main/devlink.c` | the ESP-NOW link: signed HELLO in, encrypted task list out |
+| `main/news.c` | fetches and caches the full news from the companion's PC helper |
+| `main/www/index.html` | Files and System pages (one file, two views) |
+| `main/www/climate.html` | Climate: Room, Outdoor, Sun & Moon |
+| `main/www/planner.html` | Planner: Notes, Schedule, Tables |
+| `main/www/news.html` | News, by category, with sources |
 | `partitions.csv` | two 1.875 MB OTA slots + core dump, in 4 MB |
 | `sdkconfig.defaults` | every non-default setting, each with its reason |
 | `tools/idf.ps1` | build from plain PowerShell on Windows |

@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Planner</title>
+<style>
+  :root{
+    --bg:#f7f7f8; --panel:#fff; --line:#e3e3e6; --fg:#1b1b1f;
+    --muted:#6b6b73; --accent:#2d6cdf; --danger:#c0392b; --ok:#1e8e4f; --soft:#f0f2f7;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --bg:#16161a; --panel:#1f1f25; --line:#32323b; --fg:#ececf1;
+      --muted:#9a9aa5; --accent:#5b8ff0; --danger:#e06c5b; --ok:#4cc38a; --soft:#262a34;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:1000px;margin:0 auto;padding:16px}
+  nav{display:flex;gap:4px;margin-bottom:14px;flex-wrap:wrap}
+  nav a{color:var(--muted);text-decoration:none;padding:6px 12px;border-radius:7px;
+        border:1px solid transparent;font-size:14px}
+  nav a.on{color:var(--fg);border-color:var(--line);background:var(--panel)}
+  h1{font-size:20px;margin:0 0 2px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:14px}
+  .sub.err{color:var(--danger)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .grow{flex:1;min-width:0}
+  button{font:inherit;padding:7px 13px;border-radius:7px;cursor:pointer;
+         border:1px solid var(--line);background:var(--panel);color:var(--fg)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.danger{color:var(--danger)}
+  button.icon{padding:3px 8px;border:0;background:none;color:var(--muted)}
+  button.icon:hover{color:var(--danger)}
+  input,select,textarea{font:inherit;padding:7px 10px;border:1px solid var(--line);
+        border-radius:7px;background:var(--bg);color:var(--fg);width:100%}
+  textarea{resize:vertical;min-height:260px;line-height:1.55}
+  label{font-size:12px;color:var(--muted);display:block;margin:10px 0 4px}
+  .tabs{display:flex;gap:6px;margin-bottom:14px}
+  .tabs button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  .banner{padding:10px 12px;border-radius:8px;margin-bottom:14px;font-size:14px;display:none;
+          background:color-mix(in srgb,var(--danger) 13%,transparent);color:var(--danger)}
+  .banner.show{display:flex;gap:10px;align-items:center}
+  .split{display:grid;grid-template-columns:260px 1fr;gap:14px}
+  @media (max-width:720px){
+    .split{grid-template-columns:1fr}
+    .split.editing .list{display:none}
+    .split:not(.editing) .editor{display:none}
+  }
+  .back{display:none}
+  @media (max-width:720px){ .back{display:inline-block} }
+  .list .item{padding:9px 10px;border-radius:8px;cursor:pointer;border:1px solid transparent}
+  .list .item:hover{background:var(--soft)}
+  .list .item.on{background:var(--soft);border-color:var(--line)}
+  .item .ti{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .item .sn{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .muted{color:var(--muted)}
+  .small{font-size:12px}
+  .empty{color:var(--muted);font-size:14px;padding:30px 6px;text-align:center}
+  .day-h{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:14px 0 4px}
+  .day-h.over{color:var(--danger)}
+  .ev{display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:8px;cursor:pointer}
+  .ev:hover{background:var(--soft)}
+  .ev .tm{width:64px;flex:none;font-variant-numeric:tabular-nums;color:var(--accent);font-size:14px}
+  .ev.done .ti{text-decoration:line-through;color:var(--muted)}
+  .ev input[type=checkbox]{width:auto}
+  .cal{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+  .cal .hd{font-size:11px;color:var(--muted);text-align:center;text-transform:uppercase}
+  .cal .c{min-height:78px;border:1px solid var(--line);border-radius:7px;padding:4px 5px;cursor:pointer;
+          font-size:12px;overflow:hidden}
+  .cal .c:hover{border-color:var(--accent)}
+  .cal .c.out{opacity:.4}
+  .cal .c.today{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+  .cal .dn{font-weight:600;font-size:12px}
+  .cal .chip{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-radius:4px;
+             padding:0 4px;margin-top:2px;background:color-mix(in srgb,var(--accent) 14%,transparent)}
+  .preview{font-size:13px;background:var(--soft);border-radius:8px;padding:8px 10px;margin-top:12px}
+  .grid-wrap{overflow:auto;margin-top:10px;border:1px solid var(--line);border-radius:8px}
+  table.grid{border-collapse:collapse;min-width:100%}
+  table.grid td,table.grid th{border:1px solid var(--line);padding:0;min-width:110px}
+  table.grid th{background:var(--soft)}
+  table.grid input{border:0;border-radius:0;background:transparent;padding:6px 8px}
+  table.grid th input{font-weight:600}
+  table.grid td.x,table.grid th.x{min-width:32px;width:32px;text-align:center;background:var(--panel)}
+  .dialog{border:1px solid var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav><a href="/">Files</a><a href="/climate">Climate</a><a href="/planner" class="on">Planner</a><a href="/news">News</a><a href="/system">System</a></nav>
+  <h1>Planner</h1>
+  <div class="sub" id="status">loading…</div>
+  <div class="banner" id="banner"><span class="grow" id="bannerText"></span><button id="bannerBtn">Reload</button></div>
+
+  <div class="tabs" id="tabs">
+    <button data-t="notes" class="on">Notes</button>
+    <button data-t="schedule">Schedule</button>
+    <button data-t="tables">Tables</button>
+  </div>
+
+  <!-- ============================== NOTES ============================== -->
+  <section id="tab-notes">
+    <div class="split" id="notesSplit">
+      <div class="card list">
+        <div class="row"><input id="noteSearch" class="grow" placeholder="Search notes"><button class="primary" id="noteNew">+ New</button></div>
+        <div id="noteList" style="margin-top:8px"></div>
+      </div>
+      <div class="card editor" id="noteEditor"></div>
+    </div>
+  </section>
+
+  <!-- ============================= SCHEDULE ============================ -->
+  <section id="tab-schedule" hidden>
+    <div class="card">
+      <div class="row">
+        <button class="primary" id="evNew">+ New</button>
+        <div class="tabs" style="margin:0" id="evView">
+          <button data-v="agenda" class="on">Agenda</button><button data-v="month">Month</button>
+        </div>
+        <div class="grow"></div>
+        <div class="row" id="monthNav" hidden>
+          <button id="mPrev">‹</button><strong id="mTitle"></strong><button id="mNext">›</button>
+        </div>
+      </div>
+      <div id="evForm"></div>
+      <div id="evBody"></div>
+      <div class="preview" id="deskPreview"></div>
+    </div>
+  </section>
+
+  <!-- ============================== TABLES ============================= -->
+  <section id="tab-tables" hidden>
+    <div class="split" id="tablesSplit">
+      <div class="card list">
+        <div class="row"><strong class="grow">Tables</strong><button class="primary" id="tabNew">+ New</button></div>
+        <div id="tabList" style="margin-top:8px"></div>
+      </div>
+      <div class="card editor" id="tabEditor"></div>
+    </div>
+  </section>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+/* Build DOM from a tag, attributes and children. User text only ever goes in
+ * as text nodes, never through innerHTML - a note can't inject script. */
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const k in attrs || {}) {
+    if (k.startsWith('on')) e[k] = attrs[k];
+    else if (k === 'class') e.className = attrs[k];
+    else if (k in e && k !== 'list') e[k] = attrs[k];
+    else e.setAttribute(k, attrs[k]);
+  }
+  for (const c of kids.flat()) if (c != null && c !== false) e.append(c.nodeType ? c : String(c));
+  return e;
+}
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const pad2 = n => String(n).padStart(2, '0');
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/* =========================== document storage ============================
+ * Each document is loaded whole, edited in memory and saved whole. The box
+ * only stores it; the ETag it returns must be quoted back on save, so a second
+ * tab or phone editing at the same time gets a "changed elsewhere" instead of
+ * silently overwriting. */
+const DOCS = {
+  notes:  { etag: null, data: null, empty: () => ({ v: 1, notes: [] }) },
+  events: { etag: null, data: null, empty: () => ({ v: 1, events: [] }) },
+  tables: { etag: null, data: null, empty: () => ({ v: 1, tables: [] }) },
+};
+const dirty = new Set(), timers = {}, saving = {}, again = {}, frozen = new Set();
+
+function say(text, err) {
+  $('status').textContent = text;
+  $('status').className = 'sub' + (err ? ' err' : '');
+}
+function banner(text, btnText, onBtn) {
+  $('bannerText').textContent = text;
+  $('bannerBtn').textContent = btnText || 'Reload';
+  $('bannerBtn').onclick = onBtn || (() => location.reload());
+  $('banner').className = 'banner show';
+}
+async function errOf(r) {
+  try { return (await r.json()).error || ('HTTP ' + r.status); } catch (e) { return 'HTTP ' + r.status; }
+}
+
+async function loadDoc(name) {
+  const r = await fetch('/api/planner?doc=' + name, { cache: 'no-store' });
+  if (!r.ok) throw new Error(await errOf(r));
+  const etag = r.headers.get('ETag') || 'none';
+  const body = await r.json();            // null: never saved yet
+  DOCS[name].etag = etag;
+  // Fill in anything missing, so a hand-edited or older file can't crash the page.
+  const data = Object.assign(DOCS[name].empty(), body && typeof body === 'object' ? body : {});
+  for (const k of ['notes', 'events', 'tables']) if (k in data && !Array.isArray(data[k])) data[k] = [];
+  DOCS[name].data = data;
+}
+
+function changed(name) {
+  if (frozen.has(name)) return;
+  dirty.add(name);
+  say('Unsaved changes…');
+  clearTimeout(timers[name]);
+  timers[name] = setTimeout(() => save(name), 1200);
+}
+
+async function save(name) {
+  if (frozen.has(name)) return;
+  if (saving[name]) { again[name] = true; return; }
+  saving[name] = true;
+  say('Saving…');
+  try {
+    const r = await fetch('/api/planner?doc=' + name, {
+      method: 'POST',
+      headers: { 'If-Match': DOCS[name].etag || 'none', 'Content-Type': 'application/json' },
+      body: JSON.stringify(DOCS[name].data),
+    });
+    if (r.status === 409) {
+      frozen.add(name);                    // stop autosaving over someone else's edit
+      banner(`Your ${name} were changed in another tab or device. Reload to see the latest — ` +
+             `edits made here since your last save won't be kept.`);
+      say('Not saved: changed elsewhere', true);
+      return;
+    }
+    if (!r.ok) throw new Error(await errOf(r));
+    DOCS[name].etag = (await r.json()).etag;
+    dirty.delete(name);
+    if (name === 'events') await saveUpcoming();
+    say(dirty.size ? 'Unsaved changes…' : 'All changes saved');
+  } catch (e) {
+    say('Save failed: ' + e.message + ' — will retry on your next edit', true);
+  } finally {
+    saving[name] = false;
+    if (again[name]) { again[name] = false; save(name); }
+  }
+}
+
+addEventListener('beforeunload', e => { if (dirty.size) { e.preventDefault(); e.returnValue = ''; } });
+
+/* ================================ notes ================================== */
+let noteSel = null;
+
+function sortedNotes() {
+  const q = $('noteSearch').value.trim().toLowerCase();
+  return DOCS.notes.data.notes
+    .filter(n => !q || (n.title + '\n' + n.body).toLowerCase().includes(q))
+    .sort((a, b) => (b.pinned - a.pinned) || (b.updated - a.updated));
+}
+function fmtWhen(ms) {
+  const d = new Date(ms), now = new Date();
+  if (d.toDateString() === now.toDateString()) return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  return d.getDate() + ' ' + MONTHS[d.getMonth()] + (d.getFullYear() !== now.getFullYear() ? ' ' + d.getFullYear() : '');
+}
+
+function renderNoteList() {
+  const box = $('noteList');
+  box.textContent = '';
+  const list = sortedNotes();
+  if (!list.length) box.append(el('div', { class: 'empty' }, DOCS.notes.data.notes.length ? 'No matches.' : 'No notes yet.'));
+  for (const n of list) {
+    const first = (n.body || '').split('\n').find(l => l.trim()) || '';
+    box.append(el('div', { class: 'item' + (n.id === noteSel ? ' on' : ''), onclick: () => openNote(n.id) },
+      el('div', { class: 'ti' }, (n.pinned ? '★ ' : '') + (n.title || 'Untitled')),
+      el('div', { class: 'sn' }, fmtWhen(n.updated) + ' · ' + (first || 'empty'))));
+  }
+}
+
+function openNote(id) {
+  noteSel = id;
+  $('notesSplit').classList.toggle('editing', !!id);
+  renderNoteList();
+  const ed = $('noteEditor');
+  ed.textContent = '';
+  const n = DOCS.notes.data.notes.find(x => x.id === id);
+  if (!n) { ed.append(el('div', { class: 'empty' }, 'Pick a note, or make a new one.')); return; }
+
+  const touch = () => { n.updated = Date.now(); changed('notes'); renderNoteList(); };
+  const title = el('input', { value: n.title, placeholder: 'Title', oninput: () => { n.title = title.value; touch(); } });
+  const body = el('textarea', { value: n.body, placeholder: 'Write anything…', oninput: () => { n.body = body.value; touch(); } });
+  const pin = el('button', { onclick: () => { n.pinned = !n.pinned; pin.textContent = n.pinned ? '★ Pinned' : '☆ Pin'; touch(); } },
+                 n.pinned ? '★ Pinned' : '☆ Pin');
+  ed.append(
+    el('div', { class: 'row' },
+      el('button', { class: 'back', onclick: () => openNote(null) }, '← Notes'),
+      el('div', { class: 'grow' }), pin,
+      el('button', { class: 'danger', onclick: () => {
+        if (!confirm('Delete this note?')) return;
+        DOCS.notes.data.notes = DOCS.notes.data.notes.filter(x => x.id !== n.id);
+        changed('notes'); openNote(null);
+      } }, 'Delete')),
+    el('div', { style: 'margin-top:10px' }, title),
+    el('div', { style: 'margin-top:8px' }, body),
+    el('div', { class: 'small muted', style: 'margin-top:6px' }, 'Created ' + new Date(n.created).toLocaleString()));
+  if (!n.title && !n.body) title.focus();
+}
+
+$('noteNew').onclick = () => {
+  const n = { id: uid(), title: '', body: '', pinned: false, created: Date.now(), updated: Date.now() };
+  DOCS.notes.data.notes.push(n);
+  changed('notes');
+  $('noteSearch').value = '';
+  openNote(n.id);
+};
+$('noteSearch').oninput = renderNoteList;
+
+/* =============================== schedule ================================
+ * events: [{id, title, date:"YYYY-MM-DD", time:"HH:MM"|"", repeat, until, notes, done}]
+ * repeat: none | daily | weekly | monthly | yearly. Dates are local dates. */
+const ymd = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const parseYmd = s => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
+const dayNum = d => Math.round(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / 864e5);
+const addDays = (d, n) => new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+
+/* Every date an event falls on within [from, to], as local midnights. */
+function occurrences(ev, from, to) {
+  const out = [];
+  if (!ev.date) return out;
+  const start = parseYmd(ev.date);
+  const end = ev.until && parseYmd(ev.until) < to ? parseYmd(ev.until) : to;
+  const rep = ev.repeat || 'none';
+  if (rep === 'none') {
+    if (start >= from && start <= end) out.push(start);
+  } else if (rep === 'daily' || rep === 'weekly') {
+    const step = rep === 'daily' ? 1 : 7;
+    let d = start;
+    if (d < from) d = addDays(start, Math.ceil((dayNum(from) - dayNum(start)) / step) * step);
+    for (; d <= end; d = addDays(d, step)) out.push(d);
+  } else if (rep === 'monthly' || rep === 'yearly') {
+    const day = start.getDate(), sm = start.getMonth(), sy = start.getFullYear();
+    for (let i = 0; i < 1200; i++) {
+      const d = rep === 'monthly' ? new Date(sy, sm + i, day) : new Date(sy + i, sm, day);
+      // The 31st in a 30-day month, or 29 Feb in a common year: skip that
+      // period rather than slide the event onto the next day.
+      if (d.getDate() !== day) continue;
+      if (d > end) break;
+      if (d >= from) out.push(d);
+    }
+  }
+  return out;
+}
+
+/* Occurrences with a timestamp, for agenda and Desk-Disp. */
+function expand(events, from, to) {
+  const out = [];
+  for (const ev of events) {
+    for (const d of occurrences(ev, from, to)) {
+      let at = d;
+      if (ev.time) { const [h, m] = ev.time.split(':').map(Number); at = new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, m); }
+      out.push({ ev, date: ymd(d), at: at.getTime() });
+    }
+  }
+  // All-day items sit at midnight, so they lead their day.
+  return out.sort((a, b) => a.at - b.at);
+}
+
+/* The list Desk-Disp reads: the next 30 occurrences within 90 days, repeats
+ * expanded, done tasks left out. Regenerated on every schedule save and every
+ * time this page loads, so it doesn't run dry while nothing is edited. */
+let upEtag = null, upLastBody = null;
+function upcomingItems() {
+  const now = new Date(), today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return expand(DOCS.events.data.events.filter(e => !e.done), today, addDays(today, 90))
+    .filter(o => !o.ev.time || o.at >= now.getTime())
+    .slice(0, 30)
+    .map(o => ({ at: Math.floor(o.at / 1000), date: o.date, time: o.ev.time || '',
+                 allDay: !o.ev.time, title: (o.ev.title || 'Untitled').slice(0, 60) }));
+}
+async function saveUpcoming() {
+  const items = upcomingItems();
+  const body = JSON.stringify({ v: 1, generated: Math.floor(Date.now() / 1000), items });
+  const key = JSON.stringify(items);
+  if (key === upLastBody) return;          // nothing Desk-Disp would see changed
+  const post = etag => fetch('/api/planner?doc=upcoming', {
+    method: 'POST', headers: { 'If-Match': etag, 'Content-Type': 'application/json' }, body });
+  try {
+    if (upEtag === null) upEtag = (await fetch('/api/planner?doc=upcoming', { cache: 'no-store' })).headers.get('ETag') || 'none';
+    let r = await post(upEtag);
+    if (r.status === 409) {                // derived data: just take the new tag and overwrite
+      upEtag = (await r.json()).etag;
+      r = await post(upEtag);
+    }
+    if (r.ok) { upEtag = (await r.json()).etag; upLastBody = key; }
+  } catch (e) { /* the next save retries */ }
+  renderDeskPreview();
+}
+function renderDeskPreview() {
+  const items = upcomingItems().slice(0, 2);
+  const box = $('deskPreview');
+  box.textContent = '';
+  box.append(el('strong', {}, 'Desk-Disp shows: '));
+  if (!items.length) { box.append('nothing upcoming'); return; }
+  items.forEach((it, i) => box.append(i ? ' · ' : '', (it.allDay ? whenLabel(it.date) : whenLabel(it.date) + ' ' + it.time) + ' — ' + it.title));
+}
+function whenLabel(date) {
+  const d = parseYmd(date), today = new Date();
+  const diff = dayNum(d) - dayNum(today);
+  if (diff === 0) return 'Today';
+  if (diff === 1) return 'Tomorrow';
+  if (diff > 1 && diff < 7) return DAYS[d.getDay()];
+  return d.getDate() + ' ' + MONTHS[d.getMonth()];
+}
+
+let evView = 'agenda', monthAt = new Date(), editing = null;
+
+function renderSchedule() {
+  $('monthNav').hidden = evView !== 'month';
+  $('evView').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.v === evView));
+  renderForm();
+  evView === 'agenda' ? renderAgenda() : renderMonth();
+  renderDeskPreview();
+}
+
+function evRow(o, dateLabel) {
+  const ev = o.ev;
+  const done = ev.repeat === 'none' || !ev.repeat
+    ? el('input', { type: 'checkbox', checked: !!ev.done, title: 'Done', onclick: e => e.stopPropagation(),
+                    onchange: e => { ev.done = e.target.checked; changed('events'); renderSchedule(); } })
+    : el('span', { class: 'muted small', title: 'Repeats ' + ev.repeat }, '↻');
+  return el('div', { class: 'ev' + (ev.done ? ' done' : ''), onclick: () => { editing = { ...ev }; renderSchedule(); } },
+    done,
+    el('span', { class: 'tm' }, dateLabel || (ev.time || 'all day')),
+    el('span', { class: 'ti grow' }, ev.title || 'Untitled'));
+}
+
+function renderAgenda() {
+  const box = $('evBody');
+  box.textContent = '';
+  const now = new Date(), today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const evs = DOCS.events.data.events;
+
+  // Overdue: one-off tasks in the past that were never ticked off.
+  const overdue = evs.filter(e => (!e.repeat || e.repeat === 'none') && !e.done && e.date && parseYmd(e.date) < today)
+                     .sort((a, b) => a.date.localeCompare(b.date));
+  if (overdue.length) {
+    box.append(el('div', { class: 'day-h over' }, 'Overdue'));
+    overdue.forEach(ev => box.append(evRow({ ev }, whenLabel(ev.date))));
+  }
+
+  const occ = expand(evs, today, addDays(today, 60));
+  if (!occ.length && !overdue.length) {
+    box.append(el('div', { class: 'empty' }, 'Nothing in the next 60 days. Add something with + New.'));
+    return;
+  }
+  let last = null;
+  for (const o of occ) {
+    if (o.date !== last) {
+      const d = parseYmd(o.date);
+      box.append(el('div', { class: 'day-h' }, `${whenLabel(o.date)} · ${DAYS[d.getDay()]} ${d.getDate()} ${MONTHS[d.getMonth()]}`));
+      last = o.date;
+    }
+    box.append(evRow(o));
+  }
+}
+
+function renderMonth() {
+  const box = $('evBody');
+  box.textContent = '';
+  const y = monthAt.getFullYear(), m = monthAt.getMonth();
+  $('mTitle').textContent = MONTHS[m] + ' ' + y;
+  const first = new Date(y, m, 1);
+  const lead = (first.getDay() + 6) % 7;          // weeks start on Monday
+  const from = addDays(first, -lead), to = addDays(from, 41);
+  const byDay = {};
+  for (const o of expand(DOCS.events.data.events, from, to)) (byDay[o.date] = byDay[o.date] || []).push(o);
+
+  const grid = el('div', { class: 'cal', style: 'margin-top:12px' });
+  ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].forEach(d => grid.append(el('div', { class: 'hd' }, d)));
+  const todayKey = ymd(new Date());
+  for (let i = 0; i < 42; i++) {
+    const d = addDays(from, i), key = ymd(d), items = byDay[key] || [];
+    const cell = el('div', { class: 'c' + (d.getMonth() !== m ? ' out' : '') + (key === todayKey ? ' today' : ''),
+      onclick: () => { editing = { id: null, title: '', date: key, time: '', repeat: 'none', until: '', notes: '', done: false }; renderSchedule(); } },
+      el('div', { class: 'dn' }, d.getDate()));
+    items.slice(0, 3).forEach(o => cell.append(el('div', { class: 'chip', title: o.ev.title,
+      onclick: e => { e.stopPropagation(); editing = { ...o.ev }; renderSchedule(); } },
+      (o.ev.time ? o.ev.time + ' ' : '') + (o.ev.title || 'Untitled'))));
+    if (items.length > 3) cell.append(el('div', { class: 'small muted' }, `+${items.length - 3} more`));
+    grid.append(cell);
+  }
+  box.append(grid);
+}
+
+function renderForm() {
+  const box = $('evForm');
+  box.textContent = '';
+  if (!editing) return;
+  const e = editing;
+  const f = {
+    title: el('input', { value: e.title, placeholder: 'What' }),
+    date: el('input', { type: 'date', value: e.date }),
+    time: el('input', { type: 'time', value: e.time }),
+    repeat: el('select', {}, ...['none', 'daily', 'weekly', 'monthly', 'yearly'].map(v =>
+      el('option', { value: v, selected: (e.repeat || 'none') === v }, v === 'none' ? 'does not repeat' : 'repeats ' + v))),
+    until: el('input', { type: 'date', value: e.until || '' }),
+    notes: el('textarea', { value: e.notes || '', placeholder: 'Details (optional)', style: 'min-height:70px' }),
+  };
+  const untilWrap = el('div', {}, el('label', {}, 'Repeat until (optional)'), f.until);
+  const sync = () => { untilWrap.hidden = f.repeat.value === 'none'; };
+  f.repeat.onchange = sync; sync();
+
+  box.append(el('div', { class: 'card dialog', style: 'margin:12px 0 0' },
+    el('strong', {}, e.id ? 'Edit' : 'New'),
+    el('label', {}, 'Title'), f.title,
+    el('div', { class: 'row' },
+      el('div', { class: 'grow' }, el('label', {}, 'Date'), f.date),
+      el('div', { class: 'grow' }, el('label', {}, 'Time (leave empty for all day)'), f.time)),
+    el('label', {}, 'Repeat'), f.repeat, untilWrap,
+    el('label', {}, 'Notes'), f.notes,
+    el('div', { class: 'row', style: 'margin-top:12px' },
+      el('button', { class: 'primary', onclick: () => {
+        if (!f.title.value.trim() || !f.date.value) { alert('A title and a date, please.'); return; }
+        const rec = { id: e.id || uid(), title: f.title.value.trim(), date: f.date.value, time: f.time.value,
+                      repeat: f.repeat.value, until: f.repeat.value === 'none' ? '' : f.until.value,
+                      notes: f.notes.value, done: f.repeat.value === 'none' ? !!e.done : false };
+        const list = DOCS.events.data.events, i = list.findIndex(x => x.id === rec.id);
+        if (i >= 0) list[i] = rec; else list.push(rec);
+        editing = null; changed('events'); renderSchedule();
+      } }, 'Save'),
+      el('button', { onclick: () => { editing = null; renderSchedule(); } }, 'Cancel'),
+      el('div', { class: 'grow' }),
+      e.id ? el('button', { class: 'danger', onclick: () => {
+        if (!confirm('Delete this ' + (e.repeat && e.repeat !== 'none' ? 'repeating event and all its occurrences' : 'event') + '?')) return;
+        DOCS.events.data.events = DOCS.events.data.events.filter(x => x.id !== e.id);
+        editing = null; changed('events'); renderSchedule();
+      } }, 'Delete') : null)));
+  f.title.focus();
+}
+
+$('evNew').onclick = () => {
+  editing = { id: null, title: '', date: ymd(new Date()), time: '', repeat: 'none', until: '', notes: '', done: false };
+  renderSchedule();
+};
+$('evView').querySelectorAll('button').forEach(b => b.onclick = () => { evView = b.dataset.v; renderSchedule(); });
+$('mPrev').onclick = () => { monthAt = new Date(monthAt.getFullYear(), monthAt.getMonth() - 1, 1); renderSchedule(); };
+$('mNext').onclick = () => { monthAt = new Date(monthAt.getFullYear(), monthAt.getMonth() + 1, 1); renderSchedule(); };
+
+/* ================================ tables =================================
+ * tables: [{id, name, cols:[..], rows:[[..], ..], updated}] - all strings. */
+let tabSel = null;
+
+function renderTabList() {
+  const box = $('tabList');
+  box.textContent = '';
+  const list = DOCS.tables.data.tables.slice().sort((a, b) => b.updated - a.updated);
+  if (!list.length) box.append(el('div', { class: 'empty' }, 'No tables yet.'));
+  for (const t of list) {
+    box.append(el('div', { class: 'item' + (t.id === tabSel ? ' on' : ''), onclick: () => openTable(t.id) },
+      el('div', { class: 'ti' }, t.name || 'Untitled table'),
+      el('div', { class: 'sn' }, `${t.rows.length} rows × ${t.cols.length} columns · ${fmtWhen(t.updated)}`)));
+  }
+}
+
+const csvCell = v => /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+function toCsv(t) { return [t.cols, ...t.rows].map(r => r.map(c => csvCell(c || '')).join(',')).join('\r\n'); }
+function parseCsv(text) {
+  const rows = []; let row = [], cell = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+      else if (c === '"') q = false;
+      else cell += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { row.push(cell); cell = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(cell); rows.push(row); row = []; cell = '';
+    } else cell += c;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter(r => r.some(c => c !== ''));
+}
+
+function openTable(id) {
+  tabSel = id;
+  $('tablesSplit').classList.toggle('editing', !!id);
+  renderTabList();
+  const ed = $('tabEditor');
+  ed.textContent = '';
+  const t = DOCS.tables.data.tables.find(x => x.id === id);
+  if (!t) { ed.append(el('div', { class: 'empty' }, 'Pick a table, or make a new one.')); return; }
+
+  const touch = () => { t.updated = Date.now(); changed('tables'); renderTabList(); };
+  const name = el('input', { value: t.name, placeholder: 'Table name', oninput: () => { t.name = name.value; touch(); } });
+  const gridWrap = el('div', { class: 'grid-wrap' });
+
+  const drawGrid = () => {
+    gridWrap.textContent = '';
+    const tbl = el('table', { class: 'grid' });
+    const head = el('tr', {});
+    t.cols.forEach((c, ci) => {
+      const inp = el('input', { value: c, placeholder: 'Column ' + (ci + 1), oninput: () => { t.cols[ci] = inp.value; touch(); } });
+      head.append(el('th', {}, el('div', { class: 'row', style: 'flex-wrap:nowrap;gap:0' }, inp,
+        el('button', { class: 'icon', title: 'Delete column', onclick: () => {
+          if (t.cols.length === 1) return;
+          t.cols.splice(ci, 1); t.rows.forEach(r => r.splice(ci, 1)); touch(); drawGrid();
+        } }, '×'))));
+    });
+    head.append(el('th', { class: 'x' }));
+    tbl.append(head);
+    t.rows.forEach((r, ri) => {
+      const tr = el('tr', {});
+      t.cols.forEach((_, ci) => {
+        const inp = el('input', { value: r[ci] || '', oninput: () => { r[ci] = inp.value; touch(); } });
+        tr.append(el('td', {}, inp));
+      });
+      tr.append(el('td', { class: 'x' }, el('button', { class: 'icon', title: 'Delete row', onclick: () => {
+        t.rows.splice(ri, 1); touch(); drawGrid(); } }, '×')));
+      tbl.append(tr);
+    });
+    gridWrap.append(tbl);
+  };
+  drawGrid();
+
+  const fileIn = el('input', { type: 'file', accept: '.csv,text/csv', hidden: true, onchange: async () => {
+    const f = fileIn.files[0]; fileIn.value = '';
+    if (!f) return;
+    const rows = parseCsv(await f.text());
+    if (!rows.length) { alert('That file has no rows.'); return; }
+    if (!confirm(`Replace this table with ${rows.length - 1} rows from ${f.name}?`)) return;
+    const w = Math.max(...rows.map(r => r.length));
+    t.cols = rows[0].concat(Array(w - rows[0].length).fill(''));
+    t.rows = rows.slice(1).map(r => r.concat(Array(w - r.length).fill('')));
+    touch(); drawGrid();
+  } });
+
+  ed.append(
+    el('div', { class: 'row' },
+      el('button', { class: 'back', onclick: () => openTable(null) }, '← Tables'),
+      el('div', { class: 'grow' }, name),
+      el('button', { class: 'danger', onclick: () => {
+        if (!confirm('Delete this table?')) return;
+        DOCS.tables.data.tables = DOCS.tables.data.tables.filter(x => x.id !== t.id);
+        changed('tables'); openTable(null);
+      } }, 'Delete')),
+    gridWrap,
+    el('div', { class: 'row', style: 'margin-top:10px' },
+      el('button', { onclick: () => { t.rows.push(t.cols.map(() => '')); touch(); drawGrid(); } }, '+ Row'),
+      el('button', { onclick: () => { t.cols.push(''); t.rows.forEach(r => r.push('')); touch(); drawGrid(); } }, '+ Column'),
+      el('div', { class: 'grow' }),
+      el('button', { onclick: () => fileIn.click() }, 'Import CSV'),
+      el('button', { onclick: () => {
+        const a = el('a', { href: URL.createObjectURL(new Blob([toCsv(t)], { type: 'text/csv' })),
+                            download: (t.name || 'table').replace(/[\\/:*?"<>|]/g, '_') + '.csv' });
+        a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      } }, 'Export CSV'),
+      fileIn));
+}
+
+$('tabNew').onclick = () => {
+  const t = { id: uid(), name: '', cols: ['Item', 'Notes'], rows: [['', '']], updated: Date.now() };
+  DOCS.tables.data.tables.push(t);
+  changed('tables');
+  openTable(t.id);
+};
+
+/* ================================ tabs =================================== */
+$('tabs').querySelectorAll('button').forEach(b => b.onclick = () => {
+  $('tabs').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+  for (const t of ['notes', 'schedule', 'tables']) $('tab-' + t).hidden = t !== b.dataset.t;
+  if (b.dataset.t === 'schedule') renderSchedule();
+  try { localStorage.setItem('plannerTab', b.dataset.t); } catch (e) {}
+});
+
+(async () => {
+  try {
+    // One login prompt up front, rather than one per parallel request.
+    const a = await fetch('/api/auth', { method: 'POST' });
+    if (!a.ok) throw new Error('password required');
+    await Promise.all(['notes', 'events', 'tables'].map(loadDoc));
+  } catch (e) {
+    say(e.message, true);
+    if (/system drive/.test(e.message)) banner(e.message, 'Go to Files', () => { location.href = '/'; });
+    return;
+  }
+  say('All changes saved');
+  openNote(null);
+  openTable(null);
+  renderSchedule();
+  saveUpcoming();                          // keep Desk-Disp's list fresh as days pass
+  try {
+    const t = localStorage.getItem('plannerTab');
+    if (t) { const b = $('tabs').querySelector(`[data-t="${t}"]`); if (b) b.click(); }
+  } catch (e) {}
+})();
+</script>
+</body>
+</html>

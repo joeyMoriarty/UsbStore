@@ -61,3 +61,13 @@ void thermal_request_test(void);
 
 /* What the previous cool-down (if any) recorded. */
 therm_cooldown_t thermal_last_cooldown(void);
+
+/*
+ * CPU bursts. Wrap heavy work in begin/end: while any is running the clock
+ * may go to 240 MHz - for up to 20 s at a time, then a 20 s rest, never above
+ * 65 C, never while throttled. Otherwise it stays at the normal 160 MHz.
+ */
+void     thermal_boost_begin(void);
+void     thermal_boost_end(void);
+int      thermal_cpu_mhz(void);       /* the clock right now */
+uint32_t thermal_bursts(void);        /* bursts since boot */

@@ -13,6 +13,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include "esp_err.h"
 #include "esp_http_server.h"
 
@@ -31,3 +32,17 @@ esp_err_t auth_set(const char *current, const char *next);
  * it has already sent a 401 with a Basic challenge, and the handler must
  * return ESP_OK without doing anything else. */
 bool auth_check(httpd_req_t *r);
+
+/*
+ * ---- Device key ---------------------------------------------------------
+ * A second, much narrower credential for other gadgets on the LAN (Desk-Disp
+ * today). It can post climate readings and read the upcoming-tasks list, and
+ * nothing else - so a device sitting on a desk never holds the admin
+ * password, which could reflash this board. Sent as an "X-Device-Key" header.
+ */
+esp_err_t auth_device_key_set(const char *key);   /* 16-64 chars; admin only */
+bool      auth_device_key_is_set(void);
+/* The key itself, for devlink's packet signing. False if none is set. */
+bool      auth_device_key_get(char *out, size_t n);
+/* Like auth_check(): on failure a 401 has been sent and the caller returns. */
+bool      auth_device_check(httpd_req_t *r);

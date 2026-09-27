@@ -3,6 +3,8 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_attr.h"
 #include "esp_sleep.h"
@@ -22,6 +24,10 @@ static const char *TAG = "thermal";
 #define TEST_SLEEP_S     30       /* how long the web page's test sleeps */
 #define MAX_COOL_S       1800     /* give up waiting and reboot anyway */
 #define THROTTLED_MHZ    80
+#define BOOST_MHZ        240      /* the S3's clock steps are 80, 160, 240 */
+#define BOOST_MAX_C      65.0f    /* no bursts from a chip this warm */
+#define BOOST_MAX_S      20       /* longest burst... */
+#define BOOST_REST_S     20       /* ...then at least this long at the normal clock */
 #define REC_MAGIC        0x5EA7C001u
 
 /*
@@ -96,9 +102,86 @@ static void set_cpu_mhz(int mhz)
 #endif
 }
 
+/*
+ * Bursts: while there's heavy work, the clock goes up to 240 MHz - but only
+ * as a burst, and only from a cool chip. A burst ends after BOOST_MAX_S even
+ * if the work hasn't, and the next can't start for BOOST_REST_S, so a long
+ * busy spell averages well under the full-speed heat. Throttling always wins.
+ *
+ * Every clock decision goes through apply_clock(), under one lock, so a burst
+ * starting on a web worker can never undo a throttle from this task.
+ */
+static SemaphoreHandle_t s_clk_lock;
+static portMUX_TYPE      s_boost_mux = portMUX_INITIALIZER_UNLOCKED;
+static int               s_boost_refs;           /* heavy jobs running now */
+static int               s_cur_mhz;
+static int64_t           s_burst_since = -1;     /* us; -1 = not bursting */
+static int64_t           s_rest_until;           /* us */
+static uint32_t          s_bursts;
+
+static void apply_clock(void)
+{
+    if (!s_clk_lock) {
+        return;
+    }
+    xSemaphoreTake(s_clk_lock, portMAX_DELAY);
+    if (s_state == THERM_COOLING) {              /* cooldown() owns everything */
+        xSemaphoreGive(s_clk_lock);
+        return;
+    }
+    int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_boost_mux);
+    int refs = s_boost_refs;
+    portEXIT_CRITICAL(&s_boost_mux);
+
+    int want = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+    if (s_state == THERM_WARM) {
+        want = THROTTLED_MHZ;
+    } else if (refs > 0 && !isnan(s_temp) && s_temp < BOOST_MAX_C && now >= s_rest_until &&
+               (s_burst_since < 0 || now - s_burst_since < BOOST_MAX_S * 1000000LL)) {
+        want = BOOST_MHZ;
+    }
+
+    if (want == BOOST_MHZ && s_burst_since < 0) {
+        s_burst_since = now;
+        s_bursts++;
+    } else if (want != BOOST_MHZ && s_burst_since >= 0) {
+        if (now - s_burst_since >= BOOST_MAX_S * 1000000LL) {
+            s_rest_until = now + BOOST_REST_S * 1000000LL;   /* used it all: rest */
+        }
+        s_burst_since = -1;
+    }
+    if (want != s_cur_mhz) {
+        set_cpu_mhz(want);
+        s_cur_mhz = want;
+    }
+    xSemaphoreGive(s_clk_lock);
+}
+
+void thermal_boost_begin(void)
+{
+    portENTER_CRITICAL(&s_boost_mux);
+    s_boost_refs++;
+    portEXIT_CRITICAL(&s_boost_mux);
+    apply_clock();
+}
+
+void thermal_boost_end(void)
+{
+    portENTER_CRITICAL(&s_boost_mux);
+    if (s_boost_refs > 0) {
+        s_boost_refs--;
+    }
+    portEXIT_CRITICAL(&s_boost_mux);
+    apply_clock();
+}
+
+int      thermal_cpu_mhz(void) { return s_cur_mhz; }
+uint32_t thermal_bursts(void)  { return s_bursts; }
+
 static void throttle(bool on)
 {
-    set_cpu_mhz(on ? THROTTLED_MHZ : CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
+    apply_clock();                    /* s_state already says which */
     wifi_mgr_power_save(on);
     ESP_LOGW(TAG, "%.1f C: %s", s_temp,
              on ? "throttling (CPU 80 MHz, WiFi power save)" : "back to full speed");
@@ -173,7 +256,9 @@ static void thermal_task(void *arg)
 {
     while (1) {
         /* A test request wakes this early via a task notification. */
-        bool test = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(POLL_MS)) > 0;
+        /* Wake sooner mid-burst, so one that runs out is ended on time. */
+        uint32_t wait = s_burst_since >= 0 ? 1000 : POLL_MS;
+        bool test = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait)) > 0;
         sample();
         if (isnan(s_temp) && !test) {
             continue;
@@ -188,6 +273,8 @@ static void thermal_task(void *arg)
         } else if (s_state == THERM_WARM && s_temp <= THERM_CALM_C) {
             s_state = THERM_NORMAL;
             throttle(false);
+        } else {
+            apply_clock();            /* burst ran out, or the chip warmed past 65 C */
         }
     }
 }
@@ -213,7 +300,9 @@ esp_err_t thermal_start(void)
 
     /* With CONFIG_PM_ENABLE the idle CPU clock could otherwise drop below the
      * default; pin it until throttling says otherwise. */
+    s_clk_lock = xSemaphoreCreateMutex();
     set_cpu_mhz(CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
+    s_cur_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
 
     /* 20-100 C is the sensor range with the best accuracy that still covers
      * every threshold above. */

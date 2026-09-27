@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Climate</title>
+<style>
+  :root{
+    --bg:#f7f7f8; --panel:#fff; --line:#e3e3e6; --fg:#1b1b1f;
+    --muted:#6b6b73; --accent:#2d6cdf; --danger:#c0392b; --ok:#1e8e4f;
+    --temp:#d9661f; --hum:#2d6cdf; --grid:#ececef;
+    --wind:#1e8e7e; --cloud:#7a7f8c; --pres:#8a5cc7; --rain:#2d6cdf;
+    --sun:#e0a100; --moon:#6f7fa8; --night:#1d2340; --dusk:#5b6fb0; --day:#9cc7f0;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --bg:#16161a; --panel:#1f1f25; --line:#32323b; --fg:#ececf1;
+      --muted:#9a9aa5; --accent:#5b8ff0; --danger:#e06c5b; --ok:#4cc38a;
+      --temp:#f0904a; --hum:#6b9cf5; --grid:#2a2a32;
+      --wind:#4cc3b0; --cloud:#a0a6b3; --pres:#b08ae6; --rain:#6b9cf5;
+      --sun:#f5c542; --moon:#b9c3e6; --night:#0e1224; --dusk:#34407a; --day:#2f5f96;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:860px;margin:0 auto;padding:16px}
+  nav{display:flex;gap:4px;margin-bottom:14px;flex-wrap:wrap}
+  nav a{color:var(--muted);text-decoration:none;padding:6px 12px;border-radius:7px;
+        border:1px solid transparent;font-size:14px}
+  nav a.on{color:var(--fg);border-color:var(--line);background:var(--panel)}
+  h1{font-size:20px;margin:0 0 2px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:12px}
+  .card{background:var(--panel);border:1px solid var(--line);
+        border-radius:10px;padding:14px;margin-bottom:14px}
+  .now{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-end}
+  .big{font-size:36px;font-weight:600;line-height:1;font-variant-numeric:tabular-nums}
+  .big small{font-size:16px;font-weight:500;color:var(--muted);margin-left:3px}
+  .mid{font-size:20px;font-weight:600;line-height:1.1;font-variant-numeric:tabular-nums}
+  .mid small{font-size:13px;font-weight:500;color:var(--muted);margin-left:2px}
+  .lbl{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
+  .t{color:var(--temp)} .h{color:var(--hum)}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .seg button{font:inherit;padding:6px 14px;border:0;background:var(--panel);color:var(--fg);cursor:pointer}
+  .seg button+button{border-left:1px solid var(--line)}
+  .seg button.on{background:var(--accent);color:#fff}
+  .bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .grow{flex:1;min-width:0}
+  .stats{font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .chart{position:relative;margin-top:6px}
+  .chart svg{display:block;width:100%;height:200px;overflow:visible}
+  .chart text{fill:var(--muted);font-size:11px;font-family:inherit}
+  .tip{position:absolute;pointer-events:none;background:var(--panel);border:1px solid var(--line);
+       border-radius:7px;padding:6px 9px;font-size:12px;white-space:nowrap;display:none;
+       box-shadow:0 2px 8px rgba(0,0,0,.12);font-variant-numeric:tabular-nums}
+  .msg{font-size:13px;padding:8px 10px;border-radius:7px;margin-top:10px}
+  .msg.warn{background:color-mix(in srgb,#b7791f 14%,transparent);color:#b7791f}
+  .empty{color:var(--muted);font-size:14px;padding:34px 4px;text-align:center}
+  .hint{font-size:12px;color:var(--muted);margin-top:8px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:14px 18px;margin-top:14px}
+  .fc{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+  .fc > div{border:1px solid var(--line);border-radius:9px;padding:10px;text-align:center}
+  .fc .ico{font-size:26px;line-height:1.2}
+  .fc .d{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+  .fc .tx{font-size:13px;min-height:2.6em}
+  .fc .hl{font-variant-numeric:tabular-nums}
+  .fc .hl b{color:var(--temp)}
+  .sky{display:grid;grid-template-columns:minmax(0,1fr) 150px;gap:16px;align-items:center}
+  @media (max-width:560px){ .sky{grid-template-columns:1fr} }
+  .dome svg{display:block;width:100%;height:auto}
+  .dome text{font-size:11px;fill:var(--muted)}
+  .moonbox{text-align:center}
+  .moonbox svg{width:110px;height:110px}
+  section[hidden]{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav><a href="/">Files</a><a href="/climate" class="on">Climate</a><a href="/planner">Planner</a><a href="/news">News</a><a href="/system">System</a></nav>
+  <h1 id="title">Climate</h1>
+  <div class="sub" id="sub">loading…</div>
+
+  <div class="bar">
+    <div class="seg" id="sect">
+      <button data-s="room" class="on">Room</button><button data-s="outdoor">Outdoor</button><button data-s="sky">Sun &amp; Moon</button>
+    </div>
+    <div class="grow"></div>
+    <div class="seg" id="range">
+      <button data-r="day" class="on">Day</button><button data-r="week">Week</button><button data-r="month">Month</button>
+    </div>
+  </div>
+  <div id="state"></div>
+
+  <!-- ============================== room ============================== -->
+  <section id="s-room">
+    <div class="card">
+      <div class="now">
+        <div><div class="lbl">Temperature</div><div class="big t" id="roomT">–</div></div>
+        <div><div class="lbl">Humidity</div><div class="big h" id="roomH">–</div></div>
+      </div>
+    </div>
+    <div class="card"><div class="row"><strong class="grow t">Temperature</strong><span class="stats" id="st-room-0"></span></div><div class="chart" id="ch-room-0"></div></div>
+    <div class="card"><div class="row"><strong class="grow h">Humidity</strong><span class="stats" id="st-room-1"></span></div><div class="chart" id="ch-room-1"></div>
+      <div class="hint">Shaded band: lowest to highest in each period. Line: the average.
+        From Desk-Disp's AHT10 sensor once a minute, kept for 92 days.</div></div>
+  </section>
+
+  <!-- ============================ outdoor ============================= -->
+  <section id="s-outdoor" hidden>
+    <div class="card">
+      <div class="now">
+        <div><div class="lbl" id="wxWhere">Outside</div><div class="big t" id="wxT">–</div></div>
+        <div><div class="lbl">Sky</div><div class="mid" id="wxTxt">–</div></div>
+      </div>
+      <div class="grid">
+        <div><div class="lbl">Feels like</div><div class="mid" id="wxF">–</div></div>
+        <div><div class="lbl">Humidity</div><div class="mid" id="wxH">–</div></div>
+        <div><div class="lbl">Wind</div><div class="mid" id="wxW">–</div></div>
+        <div><div class="lbl">Cloud</div><div class="mid" id="wxC">–</div></div>
+        <div><div class="lbl">Rain, last hour</div><div class="mid" id="wxR">–</div></div>
+        <div><div class="lbl">Pressure</div><div class="mid" id="wxP">–</div></div>
+      </div>
+    </div>
+    <div class="card"><div class="lbl">Forecast</div><div class="fc" id="fc"></div></div>
+    <div class="card"><div class="row"><strong class="grow t">Temperature</strong><span class="stats" id="st-out-0"></span></div><div class="chart" id="ch-out-0"></div></div>
+    <div class="card"><div class="row"><strong class="grow h">Humidity</strong><span class="stats" id="st-out-1"></span></div><div class="chart" id="ch-out-1"></div></div>
+    <div class="card"><div class="row"><strong class="grow" style="color:var(--wind)">Wind</strong><span class="stats" id="st-out-4"></span></div><div class="chart" id="ch-out-4"></div></div>
+    <div class="card"><div class="row"><strong class="grow" style="color:var(--cloud)">Cloud cover</strong><span class="stats" id="st-out-3"></span></div><div class="chart" id="ch-out-3"></div></div>
+    <div class="card"><div class="row"><strong class="grow" style="color:var(--pres)">Pressure</strong><span class="stats" id="st-out-6"></span></div><div class="chart" id="ch-out-6"></div>
+      <div class="hint">Weather and forecast from Open-Meteo, fetched by Desk-Disp's PC bridge
+        and passed on by Desk-Disp. Logged every 5 minutes; gaps mean the PC was off.</div></div>
+  </section>
+
+  <!-- ============================== sky =============================== -->
+  <section id="s-sky" hidden>
+    <div class="card">
+      <div class="sky">
+        <div class="dome" id="dome"></div>
+        <div class="moonbox"><div id="moonPic"></div><div class="mid" id="moonName">–</div><div class="stats" id="moonIll"></div></div>
+      </div>
+      <div class="grid">
+        <div><div class="lbl">Sun</div><div class="mid" id="sunPos">–</div></div>
+        <div><div class="lbl">Sunrise</div><div class="mid" id="sunRise">–</div></div>
+        <div><div class="lbl">Sunset</div><div class="mid" id="sunSet">–</div></div>
+        <div><div class="lbl">Daylight</div><div class="mid" id="dayLen">–</div></div>
+        <div><div class="lbl">Moon</div><div class="mid" id="moonPos">–</div></div>
+        <div><div class="lbl">Moonrise</div><div class="mid" id="moonRise">–</div></div>
+        <div><div class="lbl">Moonset</div><div class="mid" id="moonSet">–</div></div>
+      </div>
+      <div class="hint">Looking south: east on the left, west on the right, height above the
+        horizon upwards. The dotted lines are today's logged paths.</div>
+    </div>
+    <div class="card"><div class="row"><strong class="grow" style="color:var(--sun)">Sun altitude</strong><span class="stats" id="st-sky-0"></span></div><div class="chart" id="ch-sky-0"></div></div>
+    <div class="card"><div class="row"><strong class="grow" style="color:var(--moon)">Moon altitude</strong><span class="stats" id="st-sky-2"></span></div><div class="chart" id="ch-sky-2"></div></div>
+    <div class="card"><div class="row"><strong class="grow" style="color:var(--moon)">Moon lit</strong><span class="stats" id="st-sky-4"></span></div><div class="chart" id="ch-sky-4"></div></div>
+    <div id="dayCharts">
+      <div class="card"><div class="row"><strong class="grow" style="color:var(--sun)">Sunrise</strong><span class="stats" id="st-rise"></span></div><div class="chart" id="ch-rise"></div></div>
+      <div class="card"><div class="row"><strong class="grow" style="color:var(--sun)">Sunset</strong><span class="stats" id="st-set"></span></div><div class="chart" id="ch-set"></div></div>
+      <div class="card"><div class="row"><strong class="grow" style="color:var(--sun)">Daylight</strong><span class="stats" id="st-len"></span></div><div class="chart" id="ch-len"></div>
+        <div class="hint">One point per day, from the sunrise and sunset times logged each day.</div></div>
+    </div>
+  </section>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let range = 'day', sect = 'room';
+let cur = null, skyDoc = null, dayPath = null;
+
+const SPAN = { day: 86400e3, week: 7 * 86400e3, month: 30 * 86400e3 };
+const K = k => ({ min: 1 + 3 * k, avg: 2 + 3 * k, max: 3 + 3 * k });
+
+const pad2 = n => String(n).padStart(2, '0');
+const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const hm = ms => { const d = new Date(ms); return pad2(d.getHours()) + ':' + pad2(d.getMinutes()); };
+const clock = s => s ? hm(s * 1000) : '—';
+const cssVar = n => getComputedStyle(document.body).getPropertyValue(n).trim();
+
+// WMO weather codes, as Open-Meteo reports them.
+function wmo(c) {
+  if (c === 0) return ['Clear', '☀️'];
+  if (c === 1) return ['Mostly clear', '🌤️'];
+  if (c === 2) return ['Partly cloudy', '⛅'];
+  if (c === 3) return ['Overcast', '☁️'];
+  if (c === 45 || c === 48) return ['Fog', '🌫️'];
+  if (c >= 51 && c <= 57) return ['Drizzle', '🌦️'];
+  if (c >= 61 && c <= 67) return [c >= 65 ? 'Heavy rain' : 'Rain', '🌧️'];
+  if (c >= 71 && c <= 77) return ['Snow', '🌨️'];
+  if (c >= 80 && c <= 82) return ['Showers', '🌦️'];
+  if (c >= 85 && c <= 86) return ['Snow showers', '🌨️'];
+  if (c >= 95) return ['Thunderstorm', '⛈️'];
+  return ['—', '·'];
+}
+const compass = d => ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'][Math.round(((d % 360) + 360) % 360 / 45) % 8];
+function ago(s) {
+  if (s < 90) return s + ' s ago';
+  if (s < 5400) return Math.round(s / 60) + ' min ago';
+  return Math.round(s / 3600) + ' h ago';
+}
+function phaseName(p) {
+  return ['New moon', 'Waxing crescent', 'First quarter', 'Waxing gibbous', 'Full moon',
+          'Waning gibbous', 'Last quarter', 'Waning crescent'][Math.round(p * 8) % 8];
+}
+function big(el, v, unit) {
+  el.textContent = v;
+  if (unit) { const s = document.createElement('small'); s.textContent = unit; el.appendChild(s); }
+}
+function svg(tag, attrs) {
+  const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  return e;
+}
+function niceStep(span, want) {
+  const raw = span / want, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * mag >= raw) return m * mag;
+  return 10 * mag;
+}
+
+/* ---- units: how a value is labelled, and the smallest y-range worth showing */
+const UNITS = {
+  C:    { fmt: v => v.toFixed(1) + ' °C', axis: v => v + '°', pad: 0.5 },
+  pct:  { fmt: v => v.toFixed(0) + '%',   axis: v => v + '%', pad: 2 },
+  kmh:  { fmt: v => v.toFixed(1) + ' km/h', axis: v => v + '', pad: 1 },
+  hpa:  { fmt: v => v.toFixed(1) + ' hPa', axis: v => v + '', pad: 1 },
+  deg:  { fmt: v => v.toFixed(1) + '°',   axis: v => v + '°', pad: 5 },
+  hour: { fmt: v => pad2(Math.floor(v)) + ':' + pad2(Math.round((v % 1) * 60) % 60),
+          axis: v => pad2(Math.floor(v)) + ':' + pad2(Math.round((v % 1) * 60) % 60), pad: 0.1 },
+  dur:  { fmt: v => Math.floor(v) + 'h ' + pad2(Math.round((v % 1) * 60) % 60) + 'm',
+          axis: v => Math.floor(v) + 'h' + (v % 1 ? pad2(Math.round((v % 1) * 60)) : ''), pad: 0.1 },
+};
+
+function tickLabel(ms) {
+  const d = new Date(ms);
+  if (range === 'day')  return pad2(d.getHours()) + ':00';
+  if (range === 'week') return days[d.getDay()];
+  return d.getDate() + ' ' + months[d.getMonth()];
+}
+function tipTime(ms, daily) {
+  const d = new Date(ms);
+  const date = `${days[d.getDay()]} ${d.getDate()} ${months[d.getMonth()]}`;
+  if (daily) return date;
+  return range === 'day' ? hm(ms) : `${date}, ${hm(ms)}`;
+}
+
+/*
+ * One chart: a min-max band with the average as a line, gaps left as gaps.
+ * ctx = { x0, x1 (ms), bucket (ms), daily (points are whole days) }.
+ */
+function draw(box, pts, k, color, unit, statEl, ctx) {
+  box.textContent = '';
+  const U = UNITS[unit];
+  if (!pts.length) {
+    const e = document.createElement('div');
+    e.className = 'empty';
+    e.textContent = 'Nothing logged in this period yet.';
+    box.appendChild(e);
+    if (statEl) statEl.textContent = '';
+    return;
+  }
+  const W = Math.max(box.clientWidth, 300), Hh = 200, L = 44, R = 8, Tp = 10, B = 24;
+  const { x0, x1, bucket } = ctx;
+
+  let lo = Infinity, hi = -Infinity, sum = 0, n = 0;
+  for (const p of pts) { lo = Math.min(lo, p[k.min]); hi = Math.max(hi, p[k.max]); sum += p[k.avg]; n++; }
+  const padv = Math.max((hi - lo) * 0.15, U.pad);
+  const step = niceStep(hi - lo + 2 * padv, 4);
+  const y0 = Math.floor((lo - padv) / step) * step, y1 = Math.ceil((hi + padv) / step) * step;
+
+  const X = ms => L + (ms - x0) / (x1 - x0) * (W - L - R);
+  const Y = v => Tp + (1 - (v - y0) / (y1 - y0)) * (Hh - Tp - B);
+  const s = svg('svg', { viewBox: `0 0 ${W} ${Hh}` });
+
+  for (let v = y0; v <= y1 + 1e-9; v += step) {
+    s.appendChild(svg('line', { x1: L, x2: W - R, y1: Y(v), y2: Y(v), stroke: 'var(--grid)' }));
+    const t = svg('text', { x: L - 6, y: Y(v) + 4, 'text-anchor': 'end' });
+    t.textContent = U.axis(Math.round(v * 100) / 100);
+    s.appendChild(t);
+  }
+  if (unit === 'deg' && y0 < 0 && y1 > 0) {       // the horizon, for altitudes
+    s.appendChild(svg('line', { x1: L, x2: W - R, y1: Y(0), y2: Y(0), stroke: 'var(--muted)', 'stroke-dasharray': '4 3' }));
+  }
+
+  // Time ticks on local boundaries: every 4 h, every day, or every 5 days.
+  const tickEvery = range === 'day' ? 4 * 3600e3 : range === 'week' ? 86400e3 : 5 * 86400e3;
+  const first = new Date(x0);
+  if (range === 'day') {
+    first.setMinutes(0, 0, 0);
+    first.setHours(first.getHours() + (4 - first.getHours() % 4) % 4);
+  } else {
+    first.setHours(24, 0, 0, 0);
+  }
+  for (let t = first.getTime(); t < x1; t += tickEvery) {
+    if (t <= x0) continue;
+    s.appendChild(svg('line', { x1: X(t), x2: X(t), y1: Tp, y2: Hh - B, stroke: 'var(--grid)' }));
+    const lab = svg('text', { x: X(t), y: Hh - 6, 'text-anchor': 'middle' });
+    lab.textContent = tickLabel(t);
+    s.appendChild(lab);
+  }
+
+  // Split into runs wherever readings are missing, so a gap (Desk-Disp off,
+  // PC asleep, box rebooted) shows as a gap rather than a misleading line.
+  const runs = [];
+  let run = [];
+  pts.forEach((p, i) => {
+    if (i && (p[0] - pts[i - 1][0]) * 1000 > bucket * 2.5) { runs.push(run); run = []; }
+    run.push(p);
+  });
+  runs.push(run);
+
+  const cx = p => X(p[0] * 1000 + (ctx.daily ? 0 : bucket / 2));
+  for (const r of runs) {
+    if (r.length === 1) {
+      s.appendChild(svg('circle', { cx: cx(r[0]), cy: Y(r[0][k.avg]), r: 2.5, fill: color }));
+      continue;
+    }
+    const band = r.map(p => `${cx(p)},${Y(p[k.max])}`).concat(
+                 r.slice().reverse().map(p => `${cx(p)},${Y(p[k.min])}`)).join(' ');
+    s.appendChild(svg('polygon', { points: band, fill: color, 'fill-opacity': 0.16 }));
+    s.appendChild(svg('polyline', { points: r.map(p => `${cx(p)},${Y(p[k.avg])}`).join(' '),
+                                    fill: 'none', stroke: color, 'stroke-width': 2,
+                                    'stroke-linejoin': 'round' }));
+  }
+
+  const guide = svg('line', { y1: Tp, y2: Hh - B, stroke: color, 'stroke-dasharray': '3 3', visibility: 'hidden' });
+  const dot = svg('circle', { r: 4, fill: color, visibility: 'hidden' });
+  s.append(guide, dot);
+  box.appendChild(s);
+  const tip = document.createElement('div');
+  tip.className = 'tip';
+  box.appendChild(tip);
+
+  const move = ev => {
+    const rect = s.getBoundingClientRect();
+    const px = (ev.touches ? ev.touches[0].clientX : ev.clientX) - rect.left;
+    const ms = x0 + (px * W / rect.width - L) / (W - L - R) * (x1 - x0);
+    let best = pts[0];
+    for (const p of pts) if (Math.abs(p[0] * 1000 - ms) < Math.abs(best[0] * 1000 - ms)) best = p;
+    const gx = cx(best), gy = Y(best[k.avg]);
+    guide.setAttribute('x1', gx); guide.setAttribute('x2', gx); guide.setAttribute('visibility', 'visible');
+    dot.setAttribute('cx', gx); dot.setAttribute('cy', gy); dot.setAttribute('visibility', 'visible');
+    tip.textContent = '';
+    const l1 = document.createElement('div'); l1.textContent = tipTime(best[0] * 1000, ctx.daily);
+    const l2 = document.createElement('b'); l2.textContent = U.fmt(best[k.avg]);
+    const l3 = document.createElement('div'); l3.style.color = 'var(--muted)';
+    l3.textContent = best[k.min] === best[k.max] ? '' : `${U.fmt(best[k.min])} – ${U.fmt(best[k.max])}`;
+    tip.append(l1, l2, l3);
+    tip.style.display = 'block';
+    const left = gx * rect.width / W;
+    tip.style.left = Math.min(Math.max(left - tip.offsetWidth / 2, 0), rect.width - tip.offsetWidth) + 'px';
+    tip.style.top = '-8px';
+  };
+  const hide = () => {
+    tip.style.display = 'none';
+    guide.setAttribute('visibility', 'hidden');
+    dot.setAttribute('visibility', 'hidden');
+  };
+  s.addEventListener('mousemove', move);
+  s.addEventListener('touchmove', move, { passive: true });
+  s.addEventListener('mouseleave', hide);
+
+  if (statEl) statEl.textContent = `low ${U.fmt(lo)} · avg ${U.fmt(sum / n)} · high ${U.fmt(hi)}`;
+}
+
+const seriesCtx = d => ({ x0: d.start * 1000, x1: d.start * 1000 + SPAN[range], bucket: d.bucket_s * 1000 });
+
+/* ---- the three sections ------------------------------------------------ */
+
+const CHARTS = {
+  room:    [[0, '--temp', 'C'], [1, '--hum', 'pct']],
+  outdoor: [[0, '--temp', 'C'], [1, '--hum', 'pct'], [4, '--wind', 'kmh'], [3, '--cloud', 'pct'], [6, '--pres', 'hpa']],
+  sky:     [[0, '--sun', 'deg'], [2, '--moon', 'deg'], [4, '--moon', 'pct']],
+};
+const PREFIX = { room: 'room', outdoor: 'out', sky: 'sky' };
+
+function renderCharts() {
+  if (!cur || cur.series !== sect) return;
+  const ctx = seriesCtx(cur);
+  for (const [k, color, unit] of CHARTS[sect]) {
+    draw($(`ch-${PREFIX[sect]}-${k}`), cur.pts, K(k), cssVar(color), unit, $(`st-${PREFIX[sect]}-${k}`), ctx);
+  }
+  if (sect === 'sky') renderDayCharts();
+}
+
+function renderRoomNow() {
+  const n = cur.now;
+  if (n) { big($('roomT'), n.v[0].toFixed(1), '°C'); big($('roomH'), n.v[1].toFixed(0), '%'); }
+  else   { $('roomT').textContent = '–'; $('roomH').textContent = '–'; }
+}
+
+function renderOutdoorNow() {
+  const w = skyDoc && skyDoc.wx, sk = skyDoc && skyDoc.sky;
+  $('wxWhere').textContent = sk && sk.place ? 'Outside · ' + sk.place : 'Outside';
+  if (!w) {
+    for (const id of ['wxT', 'wxTxt', 'wxF', 'wxH', 'wxW', 'wxC', 'wxR', 'wxP']) $(id).textContent = '–';
+  } else {
+    const [txt, ico] = wmo(w.code);
+    big($('wxT'), w.t.toFixed(1), '°C');
+    $('wxTxt').textContent = ico + ' ' + txt;
+    big($('wxF'), w.feels.toFixed(1), '°C');
+    big($('wxH'), w.h.toFixed(0), '%');
+    big($('wxW'), w.wind.toFixed(0), `km/h ${compass(w.wdir)}`);
+    big($('wxC'), w.cloud.toFixed(0), '%');
+    big($('wxR'), w.rain.toFixed(1), 'mm');
+    big($('wxP'), w.pres.toFixed(0), 'hPa');
+  }
+  const fc = $('fc');
+  fc.textContent = '';
+  const list = (skyDoc && skyDoc.fc) || [];
+  if (!list.length) {
+    const e = document.createElement('div');
+    e.className = 'empty';
+    e.style.gridColumn = '1 / -1';
+    e.textContent = 'No forecast yet.';
+    fc.appendChild(e);
+  }
+  const today = new Date();
+  const todayYmd = today.getFullYear() * 10000 + (today.getMonth() + 1) * 100 + today.getDate();
+  for (const f of list) {
+    const y = Math.floor(f.ymd / 10000), m = Math.floor(f.ymd / 100) % 100, d = f.ymd % 100;
+    const date = new Date(y, m - 1, d);
+    const [txt, ico] = wmo(f.code);
+    const box = document.createElement('div');
+    const dn = document.createElement('div'); dn.className = 'd';
+    dn.textContent = f.ymd === todayYmd ? 'Today' : days[date.getDay()] + ' ' + d;
+    const ic = document.createElement('div'); ic.className = 'ico'; ic.textContent = ico;
+    const tx = document.createElement('div'); tx.className = 'tx'; tx.textContent = txt;
+    const hl = document.createElement('div'); hl.className = 'hl';
+    const hb = document.createElement('b'); hb.textContent = Math.round(f.hi) + '°';
+    hl.append(hb, ' / ' + Math.round(f.lo) + '°');
+    const pp = document.createElement('div'); pp.className = 'stats'; pp.textContent = `rain ${f.pop}%`;
+    box.append(dn, ic, tx, hl, pp);
+    fc.appendChild(box);
+  }
+}
+
+/* The moon as it looks: a lit limb and a curved terminator. */
+function moonSvg(phase, r) {
+  const s = svg('svg', { viewBox: `${-r - 4} ${-r - 4} ${2 * r + 8} ${2 * r + 8}` });
+  s.appendChild(svg('circle', { r, fill: '#2a2f45', stroke: 'var(--line)' }));
+  const waxing = phase < 0.5, c = Math.cos(2 * Math.PI * phase), rx = Math.abs(c) * r;
+  const s1 = waxing ? 1 : 0, s2 = (c > 0) === waxing ? 0 : 1;
+  s.appendChild(svg('path', {
+    d: `M0,${-r} A${r},${r} 0 0 ${s1} 0,${r} A${rx},${r} 0 0 ${s2} 0,${-r}Z`,
+    fill: '#f1ecd8',
+  }));
+  return s;
+}
+
+/* Looking south: azimuth 60..300 across, altitude 0..90 up. */
+function renderDome() {
+  const box = $('dome');
+  box.textContent = '';
+  const sk = skyDoc && skyDoc.sky;
+  const W = 400, H = 190, G = 150;                 // G: horizon line
+  const X = az => 12 + (az - 60) / 240 * (W - 24);
+  const Y = alt => G - alt / 90 * (G - 12);
+  const s = svg('svg', { viewBox: `0 0 ${W} ${H}` });
+
+  const sunAlt = sk ? sk.sun_alt : -30;
+  const skyCol = sunAlt > 6 ? '--day' : sunAlt > -6 ? '--dusk' : '--night';
+  s.appendChild(svg('rect', { x: 0, y: 0, width: W, height: G, rx: 8, fill: cssVar(skyCol) }));
+  s.appendChild(svg('rect', { x: 0, y: G, width: W, height: H - G, fill: 'var(--grid)' }));
+  s.appendChild(svg('line', { x1: 0, x2: W, y1: G, y2: G, stroke: 'var(--muted)' }));
+  for (const [az, name] of [[90, 'E'], [135, 'SE'], [180, 'S'], [225, 'SW'], [270, 'W']]) {
+    const t = svg('text', { x: X(az), y: G + 16, 'text-anchor': 'middle' });
+    t.textContent = name;
+    s.appendChild(t);
+  }
+  for (const alt of [30, 60]) {
+    s.appendChild(svg('line', { x1: 0, x2: W, y1: Y(alt), y2: Y(alt), stroke: '#ffffff', 'stroke-opacity': 0.15 }));
+  }
+
+  // Today's logged paths, from the day chart data.
+  if (dayPath && dayPath.pts.length) {
+    const K0 = K(0), K1 = K(1), K2 = K(2), K3 = K(3);
+    for (const [ka, kz, col] of [[K0, K1, '--sun'], [K2, K3, '--moon']]) {
+      const pts = dayPath.pts.filter(p => p[ka.avg] > -2 && p[kz.avg] >= 60 && p[kz.avg] <= 300);
+      if (pts.length > 1) {
+        s.appendChild(svg('polyline', { points: pts.map(p => `${X(p[kz.avg])},${Y(Math.max(p[ka.avg], 0))}`).join(' '),
+          fill: 'none', stroke: cssVar(col), 'stroke-width': 2, 'stroke-dasharray': '2 4', 'stroke-linecap': 'round' }));
+      }
+    }
+  }
+  if (sk) {
+    const place = (alt, az, col, rad) => {
+      const up = alt > 0;
+      const cxv = X(Math.min(Math.max(az, 60), 300));
+      s.appendChild(svg('circle', { cx: cxv, cy: up ? Y(alt) : G + 8, r: up ? rad : rad * 0.6,
+        fill: cssVar(col), 'fill-opacity': up ? 1 : 0.4 }));
+    };
+    place(sk.moon_alt, sk.moon_az, '--moon', 9);
+    place(sk.sun_alt, sk.sun_az, '--sun', 11);
+  }
+  box.appendChild(s);
+}
+
+function renderSkyNow() {
+  const sk = skyDoc && skyDoc.sky;
+  renderDome();
+  const pic = $('moonPic');
+  pic.textContent = '';
+  if (!sk) {
+    for (const id of ['sunPos', 'sunRise', 'sunSet', 'dayLen', 'moonPos', 'moonRise', 'moonSet', 'moonName']) $(id).textContent = '–';
+    $('moonIll').textContent = '';
+    return;
+  }
+  pic.appendChild(moonSvg(sk.phase, 48));
+  $('moonName').textContent = phaseName(sk.phase);
+  $('moonIll').textContent = `${sk.illum.toFixed(0)}% lit`;
+  const where = (alt, az) => alt > 0 ? `${alt.toFixed(1)}° ${compass(az)}` : 'below horizon';
+  $('sunPos').textContent = where(sk.sun_alt, sk.sun_az);
+  $('moonPos').textContent = where(sk.moon_alt, sk.moon_az);
+  $('sunRise').textContent = clock(sk.sunrise);
+  $('sunSet').textContent = clock(sk.sunset);
+  $('moonRise').textContent = clock(sk.moonrise);
+  $('moonSet').textContent = clock(sk.moonset);
+  if (sk.sunrise && sk.sunset) {
+    const h = (sk.sunset - sk.sunrise) / 3600;
+    $('dayLen').textContent = UNITS.dur.fmt(h);
+  } else {
+    $('dayLen').textContent = '–';
+  }
+}
+
+/* Sunrise, sunset and daylight per day, from the day summaries. */
+function renderDayCharts() {
+  $('dayCharts').hidden = range === 'day';
+  if (range === 'day' || !skyDoc) return;
+  const now = Date.now(), x0 = now - SPAN[range];
+  const hourOf = s => { const d = new Date(s * 1000); return d.getHours() + d.getMinutes() / 60; };
+  const rows = (skyDoc.days || []).map(r => {
+    const y = Math.floor(r[0] / 10000), m = Math.floor(r[0] / 100) % 100, d = r[0] % 100;
+    return { at: new Date(y, m - 1, d, 12).getTime() / 1000, sr: r[1], ss: r[2] };
+  }).filter(r => r.at * 1000 >= x0 && r.sr && r.ss);
+  const mk = f => rows.map(r => { const v = f(r); return [r.at, v, v, v]; });
+  const ctx = { x0, x1: now + 43200e3, bucket: 86400e3, daily: true };
+  const k = { min: 1, avg: 2, max: 3 };
+  draw($('ch-rise'), mk(r => hourOf(r.sr)), k, cssVar('--sun'), 'hour', $('st-rise'), ctx);
+  draw($('ch-set'),  mk(r => hourOf(r.ss)), k, cssVar('--sun'), 'hour', $('st-set'), ctx);
+  draw($('ch-len'),  mk(r => (r.ss - r.sr) / 3600), k, cssVar('--sun'), 'dur', $('st-len'), ctx);
+}
+
+/* ---- status line and warnings ----------------------------------------- */
+
+function renderState() {
+  const st = $('state');
+  st.textContent = '';
+  const warn = text => {
+    const d = document.createElement('div');
+    d.className = 'msg warn';
+    d.textContent = text;
+    st.appendChild(d);
+  };
+  const n = cur && cur.now;
+  if (sect === 'room') {
+    $('title').textContent = 'Room climate';
+    if (!n) {
+      $('sub').textContent = 'waiting for the first reading';
+      warn('No readings yet. Is Desk-Disp on, and is the same device key set on both?');
+    } else {
+      $('sub').textContent = 'from Desk-Disp · updated ' + ago(n.age_s);
+      if (n.age_s > 300) warn(`Last reading was ${ago(n.age_s)} — Desk-Disp may be off or out of range.`);
+    }
+  } else {
+    const sk = skyDoc && skyDoc.sky;
+    $('title').textContent = sect === 'outdoor' ? 'Outdoor weather' : 'Sun & Moon';
+    if (!sk) {
+      $('sub').textContent = 'waiting for data';
+      warn('Nothing from Desk-Disp\'s PC bridge yet. It needs the PC on with bridge/server.py running.');
+    } else {
+      $('sub').textContent = `${sk.place || 'outside'} · via Desk-Disp's PC bridge · updated ${ago(sk.age_s)}`;
+      if (sk.age_s > 600) warn(`Last update was ${ago(sk.age_s)} — the PC or its bridge may be off.`);
+      if (sect === 'outdoor' && !skyDoc.wx) warn('The bridge couldn\'t reach the weather service; sun and moon still work.');
+    }
+  }
+  const d = cur || skyDoc;
+  if (d && !d.clock_ok) {
+    warn('The box is still waiting for internet time, so nothing can be logged yet.');
+  } else if (d && !d.logging) {
+    warn('Not saving to disk: no system drive is chosen, or it isn\'t plugged in. Readings are ' +
+         'kept in memory only until the next reboot. Choose one on the System page.');
+  }
+}
+
+/* ---- loading ------------------------------------------------------------ */
+
+async function getJson(url) {
+  const r = await fetch(url, { cache: 'no-store' });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+let loadSeq = 0;
+async function load() {
+  const seq = ++loadSeq, s = sect, rg = range;
+  try {
+    const jobs = [getJson(`/api/climate?series=${s}&range=${rg}`)];
+    if (s !== 'room') jobs.push(getJson('/api/sky'));
+    if (s === 'sky' && rg !== 'day') jobs.push(getJson('/api/climate?series=sky&range=day'));
+    const [c, sky, day] = await Promise.all(jobs);
+    if (seq !== loadSeq) return;                 // the user moved on meanwhile
+    cur = c;
+    if (sky) skyDoc = sky;
+    if (s === 'sky') dayPath = rg === 'day' ? c : day;
+    if (s === 'room') renderRoomNow();
+    if (s === 'outdoor') renderOutdoorNow();
+    if (s === 'sky') renderSkyNow();
+    renderState();
+    renderCharts();
+  } catch (e) {
+    if (seq === loadSeq) $('sub').textContent = 'cannot reach the board: ' + e.message;
+  }
+}
+
+function pick(groupId, attr, value) {
+  $(groupId).querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset[attr] === value));
+}
+function show(s) {
+  sect = s;
+  pick('sect', 's', s);
+  for (const id of ['room', 'outdoor', 'sky']) $('s-' + id).hidden = id !== s;
+  history.replaceState(null, '', s === 'room' ? '/climate' : '/climate#' + s);
+  cur = null;
+  load();
+}
+
+$('sect').querySelectorAll('button').forEach(b => { b.onclick = () => show(b.dataset.s); });
+$('range').querySelectorAll('button').forEach(b => {
+  b.onclick = () => { range = b.dataset.r; pick('range', 'r', range); load(); };
+});
+let resizeT;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { renderCharts(); if (sect === 'sky') renderDome(); }, 150);
+});
+
+show(['outdoor', 'sky'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'room');
+setInterval(() => { if (document.visibilityState === 'visible') load(); }, 60000);
+</script>
+</body>
+</html>

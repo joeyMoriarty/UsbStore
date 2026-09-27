@@ -8,6 +8,15 @@ idf_component_register(
         "auth.c"
         "ota.c"
         "thermal.c"
+        "sysdrive.c"
+        "climate.c"
+        "planner.c"
+        "devlink.c"
+        "news.c"
     INCLUDE_DIRS "."
-    EMBED_FILES "www/index.html"
+    EMBED_FILES
+        "www/index.html"
+        "www/climate.html"
+        "www/planner.html"
+        "www/news.html"
 )

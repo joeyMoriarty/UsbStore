@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>News</title>
+<style>
+  :root{
+    --bg:#f7f7f8; --panel:#fff; --line:#e3e3e6; --fg:#1b1b1f;
+    --muted:#6b6b73; --accent:#2d6cdf; --danger:#c0392b; --ok:#1e8e4f;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --bg:#16161a; --panel:#1f1f25; --line:#32323b; --fg:#ececf1;
+      --muted:#9a9aa5; --accent:#5b8ff0; --danger:#e06c5b; --ok:#4cc38a;
+    }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:860px;margin:0 auto;padding:16px}
+  nav{display:flex;gap:4px;margin-bottom:14px;flex-wrap:wrap}
+  nav a{color:var(--muted);text-decoration:none;padding:6px 12px;border-radius:7px;
+        border:1px solid transparent;font-size:14px}
+  nav a.on{color:var(--fg);border-color:var(--line);background:var(--panel)}
+  h1{font-size:20px;margin:0 0 2px}
+  .sub{color:var(--muted);font-size:13px;margin-bottom:12px}
+  .bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+  .grow{flex:1;min-width:0}
+  .chips{display:flex;gap:6px;flex-wrap:wrap}
+  .chips button,.refresh{font:inherit;font-size:13px;padding:5px 12px;border-radius:99px;cursor:pointer;
+        border:1px solid var(--line);background:var(--panel);color:var(--fg)}
+  .chips button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+  .chips button small{opacity:.7;margin-left:4px}
+  .refresh:disabled{opacity:.5;cursor:default}
+  .msg{font-size:13px;padding:8px 10px;border-radius:7px;margin-bottom:12px;
+       background:color-mix(in srgb,#b7791f 14%,transparent);color:#b7791f}
+  .story{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+         padding:12px 14px;margin-bottom:10px}
+  .story h2{font-size:16px;line-height:1.35;margin:0 0 4px;font-weight:600}
+  .story h2 a{color:var(--fg);text-decoration:none}
+  .story h2 a:hover{color:var(--accent)}
+  .story p{margin:0 0 6px;color:var(--muted);font-size:14px}
+  .src{font-size:11.5px;color:var(--muted);letter-spacing:.01em}
+  .src a{color:var(--muted)}
+  .src a:hover{color:var(--accent)}
+  .src .cat{text-transform:uppercase;letter-spacing:.05em;font-size:10.5px}
+  .empty{color:var(--muted);font-size:14px;padding:40px 4px;text-align:center}
+  footer{font-size:11.5px;color:var(--muted);margin-top:18px;border-top:1px solid var(--line);padding-top:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav><a href="/">Files</a><a href="/climate">Climate</a><a href="/planner">Planner</a><a href="/news" class="on">News</a><a href="/system">System</a></nav>
+  <h1>News</h1>
+  <div class="sub" id="sub">loading…</div>
+
+  <div class="bar">
+    <div class="chips grow" id="chips"></div>
+    <button class="refresh" id="refresh">Refresh</button>
+  </div>
+  <div id="warn"></div>
+  <div id="list"></div>
+  <footer id="foot"></footer>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const CATS = [['all', 'All'], ['world', 'World'], ['india', 'India'], ['econ', 'Economy'],
+              ['tech', 'Tech'], ['local', 'Local']];
+const NAME = Object.fromEntries(CATS);
+let cat = CATS.some(c => c[0] === location.hash.slice(1)) ? location.hash.slice(1) : 'all';
+let data = null;
+
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const k in attrs || {}) {
+    if (k === 'class') e.className = attrs[k];
+    else if (k.startsWith('on')) e[k] = attrs[k];
+    else e.setAttribute(k, attrs[k]);
+  }
+  for (const c of kids) if (c != null) e.append(c);   // text, never HTML
+  return e;
+}
+// Only real web links: a feed could carry javascript: or data: URLs.
+const safeUrl = u => /^https?:\/\//i.test(u || '') ? u : null;
+function ago(s) {
+  if (s < 90) return 'just now';
+  if (s < 5400) return Math.round(s / 60) + ' min ago';
+  if (s < 129600) return Math.round(s / 3600) + ' h ago';
+  return Math.round(s / 86400) + ' days ago';
+}
+function when(epoch) {
+  if (!epoch) return '';
+  const s = Math.max(0, Date.now() / 1000 - epoch);
+  return s < 172800 ? ago(s) : new Date(epoch * 1000).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+}
+
+function stories() {
+  const cats = (data && data.doc && data.doc.cat) || [];
+  const out = [];
+  for (const c of cats) {
+    if (cat !== 'all' && c.k !== cat) continue;
+    for (const it of c.items || []) out.push({ ...it, k: c.k });
+  }
+  if (cat === 'all') out.sort((a, b) => (b.date || 0) - (a.date || 0));
+  return out;
+}
+
+function renderChips() {
+  const box = $('chips');
+  box.textContent = '';
+  const cats = (data && data.doc && data.doc.cat) || [];
+  const count = k => k === 'all' ? cats.reduce((n, c) => n + (c.items || []).length, 0)
+                                 : ((cats.find(c => c.k === k) || {}).items || []).length;
+  for (const [k, label] of CATS) {
+    box.append(el('button', { class: k === cat ? 'on' : '', onclick: () => {
+      cat = k;
+      history.replaceState(null, '', k === 'all' ? '/news' : '/news#' + k);
+      render();
+    } }, label, el('small', {}, String(count(k)))));
+  }
+}
+
+function render() {
+  renderChips();
+  const list = $('list');
+  list.textContent = '';
+  const items = stories();
+  if (!items.length) {
+    list.append(el('div', { class: 'empty' }, data && data.doc ? 'No stories in this section.' : 'No news yet.'));
+  }
+  for (const it of items) {
+    const url = safeUrl(it.link);
+    const title = url ? el('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, it.title)
+                      : it.title;
+    // The source, small, under each story - linked to the original article.
+    const src = el('div', { class: 'src' }, 'Source: ',
+      url ? el('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, (it.src || 'original') + ' ↗')
+          : (it.src || 'unknown'),
+      it.date ? ' · ' + when(it.date) : '',
+      cat === 'all' ? ' · ' : '', cat === 'all' ? el('span', { class: 'cat' }, NAME[it.k] || it.k) : null);
+    list.append(el('article', { class: 'story' },
+      el('h2', {}, title), it.summary ? el('p', {}, it.summary) : null, src));
+  }
+
+  // Every publisher in this view, at the foot of the page.
+  const pubs = [...new Set(items.map(it => it.src).filter(Boolean))].sort();
+  $('foot').textContent = pubs.length
+    ? 'Sources in this list: ' + pubs.join(', ') + '. Headlines and summaries are the publishers\' own, ' +
+      'from their RSS feeds, fetched by Desk-Disp\'s PC bridge. Open a story to read it on the publisher\'s site.'
+    : '';
+}
+
+function renderStatus() {
+  const w = $('warn');
+  w.textContent = '';
+  if (!data) return;
+  if (data.doc && data.age_s != null) {
+    $('sub').textContent = `${data.live ? 'Updated' : 'Last updated'} ${ago(data.age_s)} · via Desk-Disp's PC bridge`;
+  } else {
+    $('sub').textContent = 'no news yet';
+  }
+  if (!data.live && data.error) {
+    w.append(el('div', { class: 'msg' }, data.doc
+      ? `Showing the last copy: ${data.error}. Is the PC on with bridge/server.py running?`
+      : `${data.error[0].toUpperCase() + data.error.slice(1)}.`));
+  }
+}
+
+async function load(force) {
+  $('refresh').disabled = true;
+  try {
+    const r = await fetch('/api/news' + (force ? '?refresh=1' : ''), { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    data = await r.json();
+    renderStatus();
+    render();
+  } catch (e) {
+    $('sub').textContent = 'cannot reach the board: ' + e.message;
+  } finally {
+    $('refresh').disabled = false;
+  }
+}
+
+$('refresh').onclick = () => load(true);
+load(false);
+setInterval(() => { if (document.visibilityState === 'visible') load(false); }, 300000);
+</script>
+</body>
+</html>
