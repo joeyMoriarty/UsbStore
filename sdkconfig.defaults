@@ -40,9 +40,10 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # ---- FATFS ---------------------------------------------------------------
-# One FAT volume per mounted drive. The default of 2 silently caps the box at
-# two pendrives: a third enumerates fine and then fails to mount. Matches
-# USBSTORE_MAX_DRIVES in usb_storage.h.
+# One FAT volume per mounted drive, matching USBSTORE_MAX_DRIVES. Today the
+# USB channel budget is the tighter limit - the S3's 8 host channels fit a hub
+# plus 2 drives, and a third cannot even enumerate ("No more HCD channels").
+# 4 volumes leaves room for park-and-swap mounting beyond two drives.
 CONFIG_FATFS_VOLUME_COUNT=4
 # Long filenames on the heap, UTF-8 in the API so non-ASCII names survive
 # the round trip to the browser.

@@ -182,8 +182,12 @@ doesn't matter at all: nothing here uses it.)
   offer FAT32 above 32 GB, so use a third-party formatter.
 - FAT32 caps a single file at **4 GB**.
 - The firmware **never formats** a drive it can't mount. Reformat on a PC.
-- Up to **3 drives** at once in practice (tested with 2). The S3 has 8 USB host
-  channels; the hub and each drive's endpoints each take some.
+- **At most 2 drives through a hub** — a hard limit of the chip, measured, not
+  estimated. The S3 has **8 USB host channels**, and each open pipe holds one
+  for as long as the device is attached: the hub takes 2, each pendrive 3
+  (control + bulk in + bulk out). Two drives fill all 8, so a third can't even
+  enumerate — the log shows `HCD DWC: No more HCD channels available`. A single
+  drive plugged straight into the S3 (no hub) uses 3.
 - Drives are numbered `/usb0`, `/usb1`, … in **plug-in order**, so numbers can
   swap after a replug.
 
@@ -282,6 +286,9 @@ The groundwork for a real multi-drive NAS is already here: several drives
 mounted at once, per-drive volumes, and hot-plug events. What's next, in order
 of usefulness:
 
+The S3's channel budget (see [Drives](#drives)) allows exactly **two** drives
+open at once — which happens to be exactly what RAID 1 needs.
+
 1. **Stable drive identity.** Mount by USB serial number or volume label
    instead of plug order, so `/usb0` is always the same stick. Every RAID mode
    below needs to know which physical drive is which.
@@ -293,9 +300,14 @@ of usefulness:
    - **degraded mode** — keep serving when one mirror is missing,
    - **resync** — rebuild a replaced drive in the background,
    - **scrub** — periodically read both copies and compare.
-3. **JBOD / spanning.** Pool several drives into one namespace, for capacity
+3. **Park-and-swap mounting, for more than two drives.** Keep every drive
+   enumerated but hold only one drive's bulk pipes open at a time, remounting
+   on demand when you switch drives. The channel budget then fits up to four
+   drives on the hub — at the cost of never having two open together, which
+   rules out mirroring between them.
+4. **JBOD / spanning.** Pool several drives into one namespace, for capacity
    rather than safety.
-4. **Checksums.** Store a hash per file and verify on read, so silent
+5. **Checksums.** Store a hash per file and verify on read, so silent
    corruption on cheap flash gets caught, not copied to the mirror.
 
 **Why not RAID 0 (striping)?** On this chip it buys nothing: every drive shares
@@ -304,8 +316,9 @@ any faster. Parity RAID (RAID 5) is possible in principle across 3 drives, but
 the same bus limit and the S3's channel budget make it slow and fragile.
 
 **Where striping does start to make sense: ESP32-P4.** The P4 has a High-Speed
-(480 Mbit/s) USB host, forty times the bandwidth. Porting this project to the
-P4 is the path to a genuinely fast pendrive NAS.
+(480 Mbit/s) USB host — forty times the bandwidth — and more host channels, so
+more drives open at once. Porting this project to the P4 is the path to a
+genuinely fast, multi-drive pendrive NAS.
 
 Also planned:
 - **WebDAV**, so the box mounts as a network drive in Windows, macOS and Linux
@@ -336,8 +349,10 @@ Also planned:
 - **Hub support is a compile-time flag** (`CONFIG_USB_HOST_HUBS_SUPPORTED`).
   Without it a hub enumerates but its ports are invisible — it looks exactly
   like a dead hub.
-- **One FAT volume per drive** (`CONFIG_FATFS_VOLUME_COUNT=4`). The default of
-  2 silently caps the box at two drives: a third enumerates and fails to mount.
+- **One FAT volume per drive** (`CONFIG_FATFS_VOLUME_COUNT=4`). The FatFs
+  default of 2 would cap the box at two drives on its own; it's raised so the
+  firmware is ready for park-and-swap, where the USB channel budget (2 open
+  drives) rather than FatFs becomes the only limit.
 - **PSRAM is quad, not octal.** The R2 part is 2 MB quad SPI; selecting octal
   breaks boot.
 - **The console is on UART0 only.** IDF also enables a secondary console on USB
