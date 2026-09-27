@@ -226,24 +226,86 @@ static const char *mime_for(const char *name)
 }
 
 /*
- * Lock the filesystem and make sure the drive holding `path` is mounted. With
- * park-and-swap a parked drive is swapped in here, so this is where a browser
- * waits ~1 s the first time it touches one. On failure the error response has
- * already been sent and the lock is NOT held.
+ * Take a ref on the drive holding `path`, swapping it in if it was parked.
+ * On failure the error response has already been sent and no ref is held;
+ * on success the caller must usbstore_release(*ref) on every path out.
  */
-static bool lock_drive(httpd_req_t *r, const char *path, uint32_t timeout_ms)
+static bool open_drive(httpd_req_t *r, const char *path, usbstore_ref_t *ref)
 {
-    if (!usbstore_lock(timeout_ms)) {
-        fail(r, 503, "filesystem busy");
-        return false;
-    }
-    char why[64];
-    if (usbstore_acquire(path, why, sizeof(why)) != ESP_OK) {
-        usbstore_unlock();
+    char why[112];
+    if (usbstore_acquire(path, why, sizeof(why), ref) != ESP_OK) {
         fail(r, 503, why);
         return false;
     }
     return true;
+}
+
+/* Close the connection after this response. For an upload refused before its
+ * body was read, that beats letting httpd drain a possibly multi-GB body; for
+ * a download cut short, it tells the browser the file is incomplete instead
+ * of leaving it waiting on a chunked response that will never end. */
+static void drop_connection(httpd_req_t *r)
+{
+    httpd_sess_trigger_close(r->handle, httpd_req_to_sockfd(r));
+}
+
+/* ----------------------------------------------------- transfer workers */
+/*
+ * esp_http_server runs every handler on ONE task. A download used to stream
+ * inside that task until its last byte, so for minutes nothing else - status,
+ * log, temperature, the page itself - got an answer (the board still replied
+ * to ping: only the web task was stuck). Long transfers are now handed to
+ * worker tasks with httpd_req_async_handler_begin(), and the web task goes
+ * straight back to serving everything else.
+ *
+ * Two workers = two transfers at once; each has its own buffer, because the
+ * shared s_buf is only safe on the web task. Pinned to core 1 with the USB
+ * tasks, leaving core 0 to WiFi.
+ */
+#define XFER_WORKERS 2
+#define XFER_QUEUE   2          /* further transfers wait here, then get 503 */
+
+typedef void (*xfer_fn_t)(httpd_req_t *r, char *buf);
+typedef struct {
+    httpd_req_t *req;
+    xfer_fn_t    fn;
+} xfer_job_t;
+
+static QueueHandle_t s_jobs;
+
+static void xfer_worker(void *arg)
+{
+    char *buf = heap_caps_malloc(XFER_SZ, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = malloc(XFER_SZ);
+    }
+    xfer_job_t job;
+    while (1) {
+        if (xQueueReceive(s_jobs, &job, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (buf) {
+            job.fn(job.req, buf);
+        } else {
+            fail(job.req, 500, "out of memory");
+        }
+        httpd_req_async_handler_complete(job.req);
+    }
+}
+
+static esp_err_t hand_off(httpd_req_t *r, xfer_fn_t fn)
+{
+    httpd_req_t *copy = NULL;
+    if (httpd_req_async_handler_begin(r, &copy) != ESP_OK) {
+        return fail(r, 500, "out of memory");
+    }
+    const xfer_job_t job = { .req = copy, .fn = fn };
+    if (xQueueSend(s_jobs, &job, 0) != pdTRUE) {
+        fail(copy, 503, "busy: too many transfers at once - try again shortly");
+        drop_connection(copy);
+        httpd_req_async_handler_complete(copy);
+    }
+    return ESP_OK;
 }
 
 /* ---------------------------------------------------------------- routes */
@@ -349,13 +411,14 @@ static esp_err_t h_list(httpd_req_t *r)
     if (!usbstore_path_ok(path)) {
         return fail(r, 403, "path outside a mounted drive");
     }
-    if (!lock_drive(r, path, 5000)) {
+    usbstore_ref_t ref;
+    if (!open_drive(r, path, &ref)) {
         return ESP_OK;
     }
 
     DIR *dir = opendir(path);
     if (!dir) {
-        usbstore_unlock();
+        usbstore_release(ref);
         return fail(r, 404, "no such directory");
     }
 
@@ -397,7 +460,7 @@ static esp_err_t h_list(httpd_req_t *r)
         first = false;
     }
     closedir(dir);
-    usbstore_unlock();
+    usbstore_release(ref);
 
     if (err != ESP_OK) {
         return err;
@@ -411,23 +474,28 @@ static esp_err_t h_list(httpd_req_t *r)
     return ESP_OK;
 }
 
-static esp_err_t h_download(httpd_req_t *r)
+/* Runs on a transfer worker, streaming through that worker's own buffer. */
+static void do_download(httpd_req_t *r, char *buf)
 {
     char path[512];
     if (!get_param(r, "p", path, sizeof(path))) {
-        return fail(r, 400, "missing p");
+        fail(r, 400, "missing p");
+        return;
     }
     if (!usbstore_path_ok(path)) {
-        return fail(r, 403, "path outside a mounted drive");
+        fail(r, 403, "path outside a mounted drive");
+        return;
     }
-    if (!lock_drive(r, path, 5000)) {
-        return ESP_OK;
+    usbstore_ref_t ref;
+    if (!open_drive(r, path, &ref)) {
+        return;
     }
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        usbstore_unlock();
-        return fail(r, 404, "no such file");
+        usbstore_release(ref);
+        fail(r, 404, "no such file");
+        return;
     }
 
     const char *base = strrchr(path, '/');
@@ -455,56 +523,65 @@ static esp_err_t h_download(httpd_req_t *r)
     httpd_resp_set_type(r, mime_for(base));
     httpd_resp_set_hdr(r, "Content-Disposition", disp);
 
-    esp_err_t err = ESP_OK;
+    bool ok = true;
     size_t got;
-    while ((got = fread(s_buf, 1, XFER_SZ, f)) > 0) {
+    while ((got = fread(buf, 1, XFER_SZ, f)) > 0) {
         /* An overheat cool-down needs this drive unmounted; stop within a
          * chunk rather than make it wait out a long download. */
         if (thermal_cooling()) {
-            err = ESP_FAIL;
+            ok = false;
             break;
         }
-        if (httpd_resp_send_chunk(r, s_buf, got) != ESP_OK) {
+        if (httpd_resp_send_chunk(r, buf, got) != ESP_OK) {
             /* Browser cancelled, or the drive vanished mid-read. */
-            err = ESP_FAIL;
+            ok = false;
             break;
         }
     }
     fclose(f);
-    usbstore_unlock();
+    usbstore_release(ref);
 
-    if (err == ESP_OK) {
+    if (ok) {
         httpd_resp_send_chunk(r, NULL, 0);
+    } else {
+        drop_connection(r);
     }
-    return err;
 }
 
-static esp_err_t h_upload(httpd_req_t *r)
+static esp_err_t h_download(httpd_req_t *r)
 {
-    /* ESP_FAIL, not ESP_OK, on refusal: that closes the socket instead of
-     * letting httpd drain a possibly multi-GB body we are never going to use. */
-    if (!auth_check(r)) {
-        return ESP_FAIL;
-    }
+    return hand_off(r, do_download);
+}
 
+/* Runs on a transfer worker. Every refusal before the body is read also
+ * drops the connection, rather than letting httpd drain the whole body. */
+static void do_upload(httpd_req_t *r, char *buf)
+{
     char path[512];
     if (!get_param(r, "p", path, sizeof(path))) {
-        return fail(r, 400, "missing p");
+        fail(r, 400, "missing p");
+        drop_connection(r);
+        return;
     }
     if (!usbstore_path_ok(path)) {
-        return fail(r, 403, "path outside a mounted drive");
+        fail(r, 403, "path outside a mounted drive");
+        drop_connection(r);
+        return;
     }
-    /* ESP_FAIL on refusal, as for auth: close rather than drain the body. */
-    if (!lock_drive(r, path, 10000)) {
-        return ESP_FAIL;
+    usbstore_ref_t ref;
+    if (!open_drive(r, path, &ref)) {
+        drop_connection(r);
+        return;
     }
 
     /* Raw body, not multipart: the browser sends the bytes as-is so the
      * firmware never has to pull MIME boundaries out of a stream. */
     FILE *f = fopen(path, "wb");
     if (!f) {
-        usbstore_unlock();
-        return fail(r, 500, "cannot create file");
+        usbstore_release(ref);
+        fail(r, 500, "cannot create file");
+        drop_connection(r);
+        return;
     }
 
     int  left = r->content_len;
@@ -515,7 +592,7 @@ static esp_err_t h_upload(httpd_req_t *r)
             break;
         }
         int want = left < XFER_SZ ? left : XFER_SZ;
-        int got  = httpd_req_recv(r, s_buf, want);
+        int got  = httpd_req_recv(r, buf, want);
         if (got == HTTPD_SOCK_ERR_TIMEOUT) {
             continue;
         }
@@ -523,7 +600,7 @@ static esp_err_t h_upload(httpd_req_t *r)
             ok = false;
             break;
         }
-        if (fwrite(s_buf, 1, got, f) != (size_t)got) {
+        if (fwrite(buf, 1, got, f) != (size_t)got) {
             ok = false;   /* out of space, or the drive was pulled */
             break;
         }
@@ -535,12 +612,24 @@ static esp_err_t h_upload(httpd_req_t *r)
         /* A half-written file is worse than none: you would not know to retry. */
         unlink(path);
     }
-    usbstore_unlock();
+    usbstore_release(ref);
 
     if (!ok) {
-        return fail(r, 500, "write failed - drive full or removed");
+        fail(r, 500, "write failed - drive full, removed, or cooling down");
+        drop_connection(r);
+        return;
     }
-    return ok_json(r);
+    ok_json(r);
+}
+
+static esp_err_t h_upload(httpd_req_t *r)
+{
+    /* Checked here on the web task, before any hand-off: ESP_FAIL closes the
+     * socket instead of draining a body we will never use. */
+    if (!auth_check(r)) {
+        return ESP_FAIL;
+    }
+    return hand_off(r, do_upload);
 }
 
 static esp_err_t h_delete(httpd_req_t *r)
@@ -556,7 +645,8 @@ static esp_err_t h_delete(httpd_req_t *r)
     if (!usbstore_path_ok(path)) {
         return fail(r, 403, "path outside a mounted drive");
     }
-    if (!lock_drive(r, path, 5000)) {
+    usbstore_ref_t ref;
+    if (!open_drive(r, path, &ref)) {
         return ESP_OK;
     }
 
@@ -567,7 +657,7 @@ static esp_err_t h_delete(httpd_req_t *r)
          * exposed over the network, deliberately. */
         rc = S_ISDIR(st.st_mode) ? rmdir(path) : unlink(path);
     }
-    usbstore_unlock();
+    usbstore_release(ref);
 
     if (rc != 0) {
         return fail(r, 400, "delete failed (directory not empty?)");
@@ -588,11 +678,12 @@ static esp_err_t h_mkdir(httpd_req_t *r)
     if (!usbstore_path_ok(path)) {
         return fail(r, 403, "path outside a mounted drive");
     }
-    if (!lock_drive(r, path, 5000)) {
+    usbstore_ref_t ref;
+    if (!open_drive(r, path, &ref)) {
         return ESP_OK;
     }
     int rc = mkdir(path, 0775);
-    usbstore_unlock();
+    usbstore_release(ref);
 
     if (rc != 0) {
         return fail(r, 400, "mkdir failed");
@@ -821,10 +912,25 @@ esp_err_t web_server_start(void)
         return ESP_ERR_NO_MEM;
     }
 
+    s_jobs = xQueueCreate(XFER_QUEUE, sizeof(xfer_job_t));
+    if (!s_jobs) {
+        return ESP_ERR_NO_MEM;
+    }
+    for (int i = 0; i < XFER_WORKERS; i++) {
+        /* 6 KB: do_download's filename encoding buffers live on this stack. */
+        if (xTaskCreatePinnedToCore(xfer_worker, "xfer", 6144, NULL, 5, NULL, 1) != pdPASS) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_uri_handlers  = 20;
     cfg.stack_size        = 8192;
     cfg.lru_purge_enable  = true;
+    /* Transfers now overlap with page traffic, so allow more connections.
+     * Budget: 10 + httpd's 3 internal + the UDP log socket = 14 of the 16
+     * lwIP sockets (CONFIG_LWIP_MAX_SOCKETS). */
+    cfg.max_open_sockets  = 10;
     /* Generous: a 100 MB upload over a ~350 KB/s bus takes minutes, and the
      * socket must not be reaped underneath it. */
     cfg.recv_wait_timeout = 30;

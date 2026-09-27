@@ -62,31 +62,41 @@ esp_err_t usbstore_start(void);
  * the S3's port at all - a cable, adapter or power problem, not a drive one. */
 int usbstore_census(usbstore_usbdev_t *out, int max);
 
-/* Snapshot of the drive table, open and parked alike. */
+/* Snapshot of the drive table, open and parked alike. Never blocks: it is
+ * read while transfers run, and is for display only. */
 int usbstore_list(usbstore_drive_t *out, int max);
 
 /* True if path sits inside a known drive (open or parked) and contains no
- * "..". Every filesystem call from the web layer must pass this first. */
+ * "..". A cheap first filter; usbstore_acquire() re-checks under the lock. */
 bool usbstore_path_ok(const char *path);
 
-/* FATFS and the MSC driver are not reentrant, and a drive can be yanked
- * mid-read. Every filesystem access is wrapped in this lock. */
-bool usbstore_lock(uint32_t timeout_ms);
-void usbstore_unlock(void);
+/*
+ * ---- Using a drive ------------------------------------------------------
+ * Every filesystem access is bracketed by acquire/release. Holding a ref is
+ * what marks the drive IN USE: it cannot be parked, and if it is unplugged
+ * its unmount waits until the last ref is released. Refs are counted, so any
+ * number of requests may use one drive at once - FatFs already serialises
+ * access within a volume (FF_FS_REENTRANT).
+ *
+ * This replaced a single global lock, which was simpler but froze the whole
+ * web server for the length of any transfer.
+ */
+typedef int usbstore_ref_t;          /* opaque; negative = none */
 
 /*
- * Make sure the drive holding `path` is mounted, parking another if the
- * channel budget requires it. Call with usbstore_lock() HELD, before touching
- * the filesystem: holding the lock is what guarantees the drive being parked
- * has no transfer in flight. On failure a human-readable reason is copied
- * into `why`.
- *
- * The drive's idle clock restarts when the lock is released, so a long
- * download counts as use right up to its last byte.
+ * Make sure the drive holding `path` is mounted - parking an IDLE drive if
+ * the channel budget requires it - and take a ref on it. Fails, with a
+ * human-readable reason in `why`, if the only drives that could be parked
+ * are in use.
  */
-esp_err_t usbstore_acquire(const char *path, char *why, size_t why_len);
+esp_err_t usbstore_acquire(const char *path, char *why, size_t why_len,
+                           usbstore_ref_t *ref);
+
+/* Drop a ref. Restarts the drive's idle clock, so a long download counts as
+ * use right up to its last byte. Safe to call with a negative ref. */
+void usbstore_release(usbstore_ref_t ref);
 
 /* Unmount every open drive (flushing FAT) so the box can sleep or power off
- * without leaving a filesystem half-written. Waits up to timeout_ms for an
- * in-flight transfer to finish. Returns drives parked, or -1 if it timed out. */
+ * without leaving a filesystem half-written. Waits up to timeout_ms for every
+ * ref to be released. Returns drives parked, or -1 if it timed out. */
 int usbstore_park_all(uint32_t timeout_ms);

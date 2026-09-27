@@ -21,11 +21,22 @@ static const char *TAG = "usbstore";
 #define IDLE_PARK_MS  15000
 #define IDLE_CHECK_MS 2000
 
+/*
+ * Every USB task is pinned to core 1. ESP-IDF runs WiFi on core 0, so the
+ * radio never shares a core with USB traffic and the web page stays
+ * responsive during transfers. It costs no throughput: transfers are bound
+ * by the 12 Mbit/s bus, and these tasks mostly sleep waiting on it.
+ */
+#define USB_CORE 1
+
 typedef enum { ST_EMPTY = 0, ST_PARKED, ST_OPEN, ST_FAILED } slot_state_t;
 
 typedef struct {
     slot_state_t             st;
     uint8_t                  addr;
+    uint16_t                 gen;       /* bumped on each reuse: stale refs can't match */
+    int                      refs;      /* requests using the drive right now */
+    bool                     gone;      /* unplugged while in use; clean up on last release */
     msc_host_device_handle_t dev;       /* only while OPEN */
     msc_host_vfs_handle_t    vfs;       /* only while OPEN */
     char                     base[12];  /* "/usbN", fixed while plugged in */
@@ -36,9 +47,10 @@ typedef struct {
 } slot_t;
 
 static slot_t            s_slot[USBSTORE_MAX_DRIVES];
-static SemaphoreHandle_t s_lock;       /* guards s_slot and all FS access */
+/* Guards the slot table. Held only briefly - never across a transfer; a
+ * drive in use is marked by its ref count instead. */
+static SemaphoreHandle_t s_lock;
 static QueueHandle_t     s_events;
-static slot_t           *s_active;     /* drive the current lock holder acquired */
 
 typedef struct {
     enum { EV_CONNECT, EV_REMOVE, EV_GONE_ADDR } kind;
@@ -84,7 +96,7 @@ static slot_t *slot_for_path(const char *path)
 {
     for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
         slot_t *s = &s_slot[i];
-        if (s->st == ST_EMPTY) {
+        if (s->st == ST_EMPTY || s->gone) {
             continue;
         }
         size_t n = strlen(s->base);
@@ -99,22 +111,22 @@ static slot_t *slot_for_path(const char *path)
 
 /* ---------------------------------------------------------------- locking */
 
-bool usbstore_lock(uint32_t timeout_ms)
+static bool table_lock(uint32_t timeout_ms)
 {
     return xSemaphoreTake(s_lock, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 
-void usbstore_unlock(void)
+static void table_unlock(void)
 {
-    /* The idle clock starts when the holder lets go, not when it acquired:
-     * a five-minute download is use right up to its last byte. */
-    if (s_active) {
-        if (s_active->st == ST_OPEN) {
-            s_active->last_used = xTaskGetTickCount();
-        }
-        s_active = NULL;
-    }
     xSemaphoreGive(s_lock);
+}
+
+/* Empty a slot but keep its generation, so refs to the old drive stay stale. */
+static void slot_clear(slot_t *s)
+{
+    uint16_t gen = s->gen;
+    memset(s, 0, sizeof(*s));
+    s->gen = gen;
 }
 
 /* -------------------------------------------------------------- bus census */
@@ -446,7 +458,7 @@ static esp_err_t census_reset_toggles(uint8_t addr)
 }
 
 /* ------------------------------------------------------------ open / park */
-/* All of these run with s_lock held. */
+/* All of these run with s_lock held, and never on a drive with refs > 0. */
 
 static esp_err_t slot_open(slot_t *s)
 {
@@ -527,13 +539,14 @@ static void slot_park(slot_t *s)
     ESP_LOGI(TAG, "parked %s  \"%s\"", s->base, s->product);
 }
 
-/* The open drive used longest ago, other than `keep`. */
-static slot_t *lru_open(const slot_t *keep)
+/* The IDLE open drive (no refs) used longest ago, other than `keep`. A drive
+ * in use is never a candidate - that is what makes parking safe. */
+static slot_t *lru_idle(const slot_t *keep)
 {
     slot_t *best = NULL;
     for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
         slot_t *s = &s_slot[i];
-        if (s == keep || s->st != ST_OPEN) {
+        if (s == keep || s->st != ST_OPEN || s->refs > 0 || s->gone) {
             continue;
         }
         if (!best || (TickType_t)(s->last_used - best->last_used) > portMAX_DELAY / 2) {
@@ -543,55 +556,145 @@ static slot_t *lru_open(const slot_t *keep)
     return best;
 }
 
-esp_err_t usbstore_acquire(const char *path, char *why, size_t why_len)
+/* Name of an open drive that is in use, for the "busy" message. */
+static const char *busy_name(void)
 {
-    slot_t *s = slot_for_path(path);
-    if (!s) {
-        snprintf(why, why_len, "drive not present");
-        return ESP_ERR_NOT_FOUND;
-    }
-    if (s->st == ST_FAILED) {
-        snprintf(why, why_len, "%s", s->note);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    s_active = s;
-    if (s->st == ST_OPEN) {
-        return ESP_OK;
-    }
-
-    /* Parked: make room within the channel budget, then swap it in. Safe to
-     * park others here - the caller holds the lock, so none has a transfer
-     * in flight. */
-    while (count_state(ST_OPEN) >= open_limit()) {
-        slot_t *victim = lru_open(s);
-        if (!victim) {
-            break;
+    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
+        if (s_slot[i].st == ST_OPEN && s_slot[i].refs > 0) {
+            return s_slot[i].product[0] ? s_slot[i].product : s_slot[i].base;
         }
-        slot_park(victim);
     }
+    return "another drive";
+}
 
-    esp_err_t err = slot_open(s);
-    if (err != ESP_OK) {
-        snprintf(why, why_len, "%s", s->note[0] ? s->note : "could not open drive");
+/* The unmount a removal had to defer, done once nobody is using the drive. */
+static void cleanup_gone(slot_t *s)
+{
+    ESP_LOGI(TAG, "removed %s  \"%s\"  (after its last transfer ended)", s->base, s->product);
+    msc_host_vfs_unregister(s->vfs);
+    msc_host_uninstall_device(s->dev);
+    slot_clear(s);
+}
+
+/*
+ * How long a swap waits for an in-use drive to free up. Listings, deletes and
+ * new folders release their ref within milliseconds, so a tab clicked while
+ * the previous folder is still loading just waits and swaps - exactly as it
+ * did with the old global lock. Only a genuinely long transfer outlasts this
+ * and gets "busy".
+ */
+#define SWAP_WAIT_MS 3000
+
+esp_err_t usbstore_acquire(const char *path, char *why, size_t why_len,
+                           usbstore_ref_t *ref)
+{
+    *ref = -1;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SWAP_WAIT_MS);
+
+    while (1) {
+        /* Opening a drive under the lock takes ~10 ms; 5 s only ever expires
+         * if something is badly wrong. */
+        if (!table_lock(5000)) {
+            snprintf(why, why_len, "storage busy");
+            return ESP_ERR_TIMEOUT;
+        }
+
+        slot_t *s = slot_for_path(path);
+        esp_err_t err = ESP_OK;
+        bool retry = false;
+        if (!s) {
+            snprintf(why, why_len, "drive not present");
+            err = ESP_ERR_NOT_FOUND;
+        } else if (s->st == ST_FAILED) {
+            snprintf(why, why_len, "%s", s->note);
+            err = ESP_ERR_INVALID_STATE;
+        } else if (s->st == ST_PARKED) {
+            /* Make room within the channel budget by parking IDLE drives
+             * only - never pull a drive out from under a transfer. */
+            while (count_state(ST_OPEN) >= open_limit()) {
+                slot_t *victim = lru_idle(s);
+                if (!victim) {
+                    if ((int32_t)(xTaskGetTickCount() - deadline) < 0) {
+                        retry = true;          /* wait for it outside the lock */
+                    } else {
+                        snprintf(why, why_len,
+                                 "busy: \"%s\" is in use by a transfer - "
+                                 "try again when it finishes", busy_name());
+                        err = ESP_ERR_INVALID_STATE;
+                    }
+                    break;
+                }
+                slot_park(victim);
+            }
+            if (!retry && err == ESP_OK && (err = slot_open(s)) != ESP_OK) {
+                snprintf(why, why_len, "%s", s->note[0] ? s->note : "could not open drive");
+            }
+        }
+
+        if (retry) {
+            table_unlock();
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (err == ESP_OK) {
+            s->refs++;
+            s->last_used = xTaskGetTickCount();
+            *ref = ((int)(s->gen & 0x7FFF) << 8) | (int)(s - s_slot);
+        }
+        table_unlock();
+        return err;
     }
-    return err;
+}
+
+void usbstore_release(usbstore_ref_t ref)
+{
+    if (ref < 0 || (ref & 0xFF) >= USBSTORE_MAX_DRIVES) {
+        return;
+    }
+    table_lock(portMAX_DELAY);
+    slot_t *s = &s_slot[ref & 0xFF];
+    /* Generation check: if the drive was pulled and its slot reused, this
+     * ref belongs to a drive that no longer exists - leave the new one be. */
+    if ((s->gen & 0x7FFF) == (ref >> 8) && s->refs > 0) {
+        s->refs--;
+        s->last_used = xTaskGetTickCount();   /* idle clock starts at the last byte */
+        if (s->refs == 0 && s->gone) {
+            cleanup_gone(s);
+        }
+    }
+    table_unlock();
 }
 
 int usbstore_park_all(uint32_t timeout_ms)
 {
-    if (!usbstore_lock(timeout_ms)) {
-        return -1;
-    }
-    int n = 0;
-    for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
-        if (s_slot[i].st == ST_OPEN) {
-            slot_park(&s_slot[i]);
-            n++;
+    /* Transfers check thermal_cooling() every chunk and release their refs
+     * within milliseconds; this waits for that, then unmounts everything. */
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+    while (1) {
+        if (table_lock(100)) {
+            bool in_use = false;
+            for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
+                in_use |= s_slot[i].st == ST_OPEN && s_slot[i].refs > 0;
+            }
+            if (!in_use) {
+                int n = 0;
+                for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
+                    if (s_slot[i].st == ST_OPEN && !s_slot[i].gone) {
+                        slot_park(&s_slot[i]);
+                        n++;
+                    }
+                }
+                table_unlock();
+                return n;
+            }
+            table_unlock();
         }
+        if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) {
+            return -1;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
-    xSemaphoreGive(s_lock);
-    return n;
 }
 
 /* ------------------------------------------------------------- queries */
@@ -605,23 +708,22 @@ bool usbstore_path_ok(const char *path)
     if (strstr(path, "..")) {
         return false;
     }
-    if (!usbstore_lock(500)) {
-        return false;
-    }
-    bool ok = slot_for_path(path) != NULL;
-    xSemaphoreGive(s_lock);     /* plain give: a lookup is not "use" */
-    return ok;
+    /* Lock-free: a cheap early reject only. usbstore_acquire() re-checks
+     * under the lock, so a drive vanishing in between is still caught. */
+    return slot_for_path(path) != NULL;
 }
 
+/*
+ * Deliberately lock-free. It feeds the status page, which must keep working
+ * while a drive is being opened; a torn read can at worst show one stale
+ * field for one poll. Nothing acts on this snapshot.
+ */
 int usbstore_list(usbstore_drive_t *out, int max)
 {
     int n = 0;
-    if (!usbstore_lock(500)) {
-        return 0;
-    }
     for (int i = 0; i < USBSTORE_MAX_DRIVES && n < max; i++) {
         const slot_t *s = &s_slot[i];
-        if (s->st == ST_EMPTY) {
+        if (s->st == ST_EMPTY || s->gone) {
             continue;
         }
         usbstore_drive_t *d = &out[n++];
@@ -638,7 +740,6 @@ int usbstore_list(usbstore_drive_t *out, int max)
             snprintf(d->product, sizeof(d->product), "USB drive");
         }
     }
-    xSemaphoreGive(s_lock);
     return n;
 }
 
@@ -646,14 +747,14 @@ int usbstore_list(usbstore_drive_t *out, int max)
 
 static void on_connect(uint8_t addr)
 {
-    if (!usbstore_lock(10000)) {
+    if (!table_lock(10000)) {
         ESP_LOGE(TAG, "drive %u: storage busy, not added", addr);
         return;
     }
 
     for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
-        if (s_slot[i].st != ST_EMPTY && s_slot[i].addr == addr) {
-            xSemaphoreGive(s_lock);         /* duplicate event */
+        if (s_slot[i].st != ST_EMPTY && !s_slot[i].gone && s_slot[i].addr == addr) {
+            table_unlock();                 /* duplicate event */
             return;
         }
     }
@@ -667,12 +768,13 @@ static void on_connect(uint8_t addr)
     }
     if (idx < 0) {
         ESP_LOGW(TAG, "drive %u ignored: all %d slots in use", addr, USBSTORE_MAX_DRIVES);
-        xSemaphoreGive(s_lock);
+        table_unlock();
         return;
     }
 
     slot_t *s = &s_slot[idx];
-    memset(s, 0, sizeof(*s));
+    slot_clear(s);
+    s->gen++;                  /* any ref to this slot's previous drive is now stale */
     s->st   = ST_PARKED;
     s->addr = addr;
     snprintf(s->base, sizeof(s->base), "/usb%d", idx);
@@ -685,43 +787,54 @@ static void on_connect(uint8_t addr)
     if (count_state(ST_OPEN) == 0) {
         slot_open(s);
     }
-    xSemaphoreGive(s_lock);
+    table_unlock();
 }
 
-/* An installed (OPEN) drive left: the MSC driver reported it. */
+/*
+ * An installed (OPEN) drive left: the MSC driver reported it.
+ *
+ * If a transfer is using it, don't unmount under an open file - mark it gone
+ * so no new request can reach it, and let the last usbstore_release() do the
+ * cleanup. The transfer itself fails fast: the device no longer answers.
+ */
 static void on_msc_removed(msc_host_device_handle_t dev)
 {
-    if (!usbstore_lock(10000)) {
-        return;
-    }
+    table_lock(portMAX_DELAY);    /* held only briefly by anyone now */
     for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
         slot_t *s = &s_slot[i];
-        if (s->st == ST_OPEN && s->dev == dev) {
+        if (s->st != ST_OPEN || s->dev != dev || s->gone) {
+            continue;
+        }
+        if (s->refs > 0) {
+            s->gone = true;
+            ESP_LOGW(TAG, "%s \"%s\" pulled while in use - unmounting when its transfer ends",
+                     s->base, s->product);
+        } else {
             ESP_LOGI(TAG, "removed %s  \"%s\"", s->base, s->product);
             msc_host_vfs_unregister(s->vfs);
             msc_host_uninstall_device(s->dev);
-            memset(s, 0, sizeof(*s));
+            slot_clear(s);
         }
     }
-    xSemaphoreGive(s_lock);
+    table_unlock();
 }
 
 /* Any device left, per the census. Only acts on drives the MSC driver was
- * not tracking - OPEN ones are cleaned up by on_msc_removed(). */
+ * not tracking - OPEN ones are cleaned up by on_msc_removed(). A parked or
+ * failed drive can't hold refs (acquire opens before counting), so it is
+ * always safe to drop immediately. */
 static void on_gone_addr(uint8_t addr)
 {
-    if (!usbstore_lock(10000)) {
-        return;
-    }
+    table_lock(portMAX_DELAY);
     for (int i = 0; i < USBSTORE_MAX_DRIVES; i++) {
         slot_t *s = &s_slot[i];
         if ((s->st == ST_PARKED || s->st == ST_FAILED) && s->addr == addr) {
             ESP_LOGI(TAG, "removed %s  \"%s\"  (was %s)", s->base, s->product,
                      s->st == ST_PARKED ? "parked" : "failed");
-            memset(s, 0, sizeof(*s));
+            slot_clear(s);
         }
     }
-    xSemaphoreGive(s_lock);
+    table_unlock();
 }
 
 /* Runs in the MSC driver's task: post to a queue, do the slow work elsewhere. */
@@ -758,30 +871,29 @@ static void worker_task(void *arg)
 /*
  * Parks the less recently used of two open drives once it has been idle for
  * IDLE_PARK_MS, and enforces the one-open rule if a third drive turned up.
- * A lock it cannot get immediately means a transfer is running - by
- * definition not idle - so it just tries again next round.
+ * Only drives with no refs are ever candidates, so a transfer is never cut.
  */
 static void idle_task(void *arg)
 {
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(IDLE_CHECK_MS));
-        if (!usbstore_lock(50)) {
+        if (!table_lock(50)) {
             continue;
         }
         while (count_state(ST_OPEN) > open_limit()) {
-            slot_t *victim = lru_open(NULL);
+            slot_t *victim = lru_idle(NULL);
             if (!victim) {
-                break;
+                break;              /* all in use: try again next round */
             }
             slot_park(victim);
         }
         if (count_state(ST_OPEN) > 1) {
-            slot_t *victim = lru_open(NULL);
+            slot_t *victim = lru_idle(NULL);
             if (victim && xTaskGetTickCount() - victim->last_used > pdMS_TO_TICKS(IDLE_PARK_MS)) {
                 slot_park(victim);
             }
         }
-        xSemaphoreGive(s_lock);
+        table_unlock();
     }
 }
 
@@ -820,7 +932,7 @@ esp_err_t usbstore_start(void)
     };
     ESP_ERROR_CHECK(usb_host_install(&host_cfg));
 
-    if (xTaskCreate(host_lib_task, "usb_host", 4096, NULL, 4, NULL) != pdPASS) {
+    if (xTaskCreatePinnedToCore(host_lib_task, "usb_host", 4096, NULL, 4, NULL, USB_CORE) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -835,7 +947,7 @@ esp_err_t usbstore_start(void)
         },
     };
     ESP_ERROR_CHECK(usb_host_client_register(&diag_cfg, &s_diag));
-    if (xTaskCreate(diag_task, "usb_census", 4096, NULL, 3, NULL) != pdPASS) {
+    if (xTaskCreatePinnedToCore(diag_task, "usb_census", 4096, NULL, 3, NULL, USB_CORE) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
 
@@ -853,14 +965,15 @@ esp_err_t usbstore_start(void)
         .create_backround_task = true,
         .task_priority         = 5,
         .stack_size            = 4096,
+        .core_id               = USB_CORE,
         .callback              = msc_cb,
     };
     ESP_ERROR_CHECK(msc_host_install(&msc_cfg));
 
-    if (xTaskCreate(worker_task, "usb_mount", 5120, NULL, 3, NULL) != pdPASS) {
+    if (xTaskCreatePinnedToCore(worker_task, "usb_mount", 5120, NULL, 3, NULL, USB_CORE) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
-    if (xTaskCreate(idle_task, "usb_idle", 4096, NULL, 2, NULL) != pdPASS) {
+    if (xTaskCreatePinnedToCore(idle_task, "usb_idle", 4096, NULL, 2, NULL, USB_CORE) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
 
