@@ -80,6 +80,8 @@ one of these. This project gets past all of them, and documents how:
 - **News**: the full stories behind a companion display's headlines, with a
   small linked source under each
 - **CPU bursts**: up to 240 MHz for heavy work, from a cool chip, 20 s at a time
+- **Pomodoro** timer, run by the box, set up on the Planner's Focus tab and shown
+  on the companion display's clock
 
 The web UI has five tabs: **Files · Climate · Planner · News · System**.
 
@@ -297,6 +299,12 @@ The Sun & Moon section draws a south-facing horizon with today's traced paths,
 the moon in its current phase, and — for a week or a month — sunrise, sunset
 and daylight trends.
 
+Each series has a minimum gap between stored readings (room 20 s, sky 2 min,
+weather 5 min), measured from the last reading *stored*. (It was once measured
+from the last one *received*: with a reading every minute and a 2-minute gap,
+nothing was ever stored unless one happened to go missing — and the sun and
+weather logs silently stopped on a quiet morning.)
+
 Readings are buffered in RAM and written in batches every 10 minutes, so the
 system drive is touched six times an hour rather than sixty — with
 park-and-swap, each touch may mean swapping it in. A finished day is summarised
@@ -331,6 +339,19 @@ admin password — to read as well as write.
   already expanded — so a small device can show "what's next" without
   understanding repeat rules.
 
+## Pomodoro
+
+The Planner's **Focus** tab sets up a focus/break timer — focus, short break
+and long break lengths, how many rounds, an optional label — and starts,
+pauses, skips or stops it. The box runs it: it moves from phase to phase by
+itself (or waits for Resume, if you prefer), so closing the page changes
+nothing. The companion display asks for the state every 3 seconds over the
+ESP-NOW link and shows it on its analog clock: a band inside the bezel from
+the minute hand to where the minute hand will be when the phase ends — red
+for focus, green for a break — so the hand meets the end of the band exactly
+on time. Only changes cross the link; each side counts down from the end time
+on its own.
+
 ## News
 
 The companion display's PC helper reads a dozen RSS feeds (world, India,
@@ -349,37 +370,35 @@ lets another device post room readings and read the upcoming tasks, and
 nothing else. It never holds the admin password, which could reflash the box.
 
 Over HTTP it's an `X-Device-Key` header (`POST /api/climate/ingest`,
-`GET /api/planner?doc=upcoming`). But many networks — campus, office, guest
-WiFi — turn on **client isolation**: the access point refuses to pass traffic
-between its own WiFi clients, so two boards that both reach the internet can't
-reach each other. (Both reachable from a wired PC, neither from the other, mDNS
-dead: that's the signature.)
-
-So the box also speaks **ESP-NOW**: frames go radio to radio on the channel
-both boards already share with the access point, and the router never sees
-them. Once a minute the companion broadcasts a 134-byte HELLO (room reading,
-sun, moon, weather, forecast, and where its PC helper is); the box logs it and
-answers with a 230-byte reply carrying the next four tasks.
-
-The same isolation stops **phones** on that WiFi from opening the box. The
-companion's PC helper includes a small relay for that: a phone opens
-`http://<PC>:8080/` and every request is passed through to the box, uploads
-and the password prompt included.
+`GET /api/planner?doc=upcoming`). The companion display, though, talks to the
+box over **ESP-NOW**: frames go radio to radio on the channel both boards
+already share with the access point — no IP address, no ARP, no router in the
+path. Once a minute it broadcasts a 134-byte HELLO (room reading, sun, moon,
+weather, forecast, and where its PC helper is); the box logs it and answers
+with a 243-byte reply carrying the next three tasks, titles up to 60 bytes.
+(HTTP between the two boards turned out to be unreliable on the network this
+was built on; ESP-NOW has answered every minute.)
 
 - **Signed and encrypted.** ESP-NOW isn't covered by the WiFi password. Keys for
   signing and encrypting are derived from the device key with HMAC-SHA256;
   every packet carries a signature, the task list is encrypted with an
   HMAC-counter-mode keystream, replies must echo the requester's random nonce,
   and readings only count if the sender's clock is within 5 minutes.
-- **Radios that sleep.** The box listens 25 ms in every 100 (the ESP-NOW
-  default keeps the radio on permanently — more heat); the companion repeats
-  its HELLO every 60 ms until answered, and a repeat gets the same reply
-  rather than a second log entry.
+- **Radios that sleep.** The companion keeps its radio awake for the exchange
+  and repeats its HELLO every 60 ms until answered; a repeat gets the same
+  reply rather than a second log entry. The box sets no ESP-NOW listening
+  schedule of its own — see tip 16 for what one did.
 - **Never touches the drive.** The task list is parsed into RAM when the
   planner saves it, so the minute-by-minute traffic can't cause a swap.
 
 The System page shows the link's WiFi channel, when it last heard from the
-companion, and how many packets it rejected.
+companion, and how many packets it rejected — and a **Desk-Disp card** to
+change the companion's modes from the browser: the clock's time zone, clock
+or sky view, and what its small OLED shows. Every 3-second poll carries the
+display's current modes (so the card shows what the desk really shows, even
+after a button press on the desk) and brings back the latest request, which
+the display applies only when its number changes — so it never undoes a
+button press, and a request left over from before a reboot never replays.
 
 ## Thermal protection
 
@@ -388,7 +407,7 @@ The web page shows the chip's temperature, and the firmware acts on it:
 | Chip temperature | What happens |
 |---|---|
 | below 70 °C | normal |
-| **70 °C** | **throttle, stay online**: CPU 160 → 80 MHz, WiFi radio power saving. Transfers get slower; everything keeps working. Back to normal below 62 °C. |
+| **70 °C** | **throttle, stay online**: CPU 160 → 80 MHz. Transfers get slower; everything keeps working. Back to normal below 62 °C. (The WiFi radio is left alone: its deepest sleep made the box unreachable — see tip 16.) |
 | **85 °C** | **cool-down**: transfers stop, every drive is **unmounted** (so FAT is never left half-written), the USB bus is suspended, WiFi is turned off, and the chip **light-sleeps** in 15 s rounds until it's below 60 °C — then reboots cleanly. The page says what happened afterwards. |
 
 The reading is the chip's **die** temperature from its built-in sensor. It
@@ -513,6 +532,10 @@ adapter: hold its `EN` pin to `GND`, wire the S3's **GPIO 43** to the DevKit's
 | GET | `/api/climate?series=room\|outdoor\|sky&range=day\|week\|month` | — | chart data: `[epoch, min, avg, max, …]` per field |
 | GET | `/api/sky` | — | latest sun, moon, weather, forecast, and a line per day |
 | GET | `/api/news[?refresh=1]` | — | the full news, with its age and whether the PC answered |
+| GET | `/api/desk` | — | the companion display's modes, as it last reported them |
+| POST | `/api/desk` | ✔ | `{"zone": "ist"\|"nl", "view": "clock"\|"sky", "oled": "auto"\|"room"\|"news"}` (any subset) |
+| GET | `/api/pomodoro` | ✔ | the timer's state and settings |
+| POST | `/api/pomodoro` | ✔ | `{"action": "start"\|"pause"\|"resume"\|"skip"\|"stop", …settings}` |
 | POST | `/api/climate/ingest` | device key | a room reading: `{"t": 24.5, "h": 55}` |
 | GET | `/api/planner?doc=notes\|events\|tables\|upcoming` | ✔ (upcoming: or device key) | a planner document, with its `ETag` |
 | POST | `/api/planner?doc=…` | ✔ + `If-Match` | save it whole; `409` if it changed meanwhile |
@@ -693,14 +716,39 @@ If the router drops the connection, the board reconnects on its own, waiting
 `esp_timer`, because blocking inside the WiFi event handler would stall every
 other event.
 
-### 16. When the network won't let two boards talk, go under it
+### 16. Test one layer at a time — ARP, TCP, HTTP
 
-Client isolation made every HTTP connection between two ESP32s on the same
-WiFi fail. ESP-NOW doesn't go through the access point at all. Two things make
-it work alongside normal WiFi: both boards must be on the access point's
-channel (add peers with channel `0`, "wherever I am now"), and because sleeping
-radios miss frames, the receiver needs a wake window and the sender needs to
-repeat until answered.
+After the ESP-NOW link went in, phones could no longer open the box — even by
+IP — while the PC carried on fine. The first theory ("the WiFi isolates its
+clients") fitted every symptom and was wrong. What found it was testing each
+layer on its own from another WiFi client:
+
+```
+PC        ARP answered   TCP open      HTTP 200
+gateway   ARP answered   TCP refused   (no web server - fine)
+the box   ARP: none      TCP failed
+```
+
+Before any connection, a device broadcasts "who has 192.168.50.194?" (ARP),
+and the owner must answer. The box wasn't. The PC still worked only because it
+had learned the box's address long before and re-checks it with unicast, which
+never depends on a broadcast getting through — so the fault was invisible from
+the one machine used for testing.
+
+The cause was one line: an ESP-NOW listening schedule
+(`esp_now_set_wake_window`, 25 ms in every 100, added to save heat). The radio
+already naps between beacons and wakes for the ones followed by broadcasts;
+with a second schedule competing, it slept through them. Deleting it fixed the
+phone at once. For the same reason, thermal throttling no longer switches the
+radio to `WIFI_PS_MAX_MODEM`, which skips those wake-ups — it would have made
+the box unreachable exactly when hot. Lessons: test from a device that has
+never talked to the target, and from where your users are — mDNS tests from
+the wired PC all failed too, because its multicast never reached the WiFi,
+while `usbstore.local` worked from the phone throughout.
+
+ESP-NOW itself works alongside normal WiFi as long as both boards are on the
+access point's channel (add peers with channel `0`, "wherever I am now") and
+the sender repeats until answered.
 
 ### 17. Version and size-check anything that crosses a wire
 
@@ -806,6 +854,8 @@ two masters on one FAT table corrupts it).
 | `main/planner.c` | planner documents: ETag, If-Match, crash-safe saves |
 | `main/devlink.c` | the ESP-NOW link: signed HELLO in, encrypted task list out |
 | `main/news.c` | fetches and caches the full news from the companion's PC helper |
+| `main/pomodoro.c` | the focus/break timer and its API |
+| `main/deskctl.c` | the companion display's modes: reported state and web requests |
 | `main/www/index.html` | Files and System pages (one file, two views) |
 | `main/www/climate.html` | Climate: Room, Outdoor, Sun & Moon |
 | `main/www/planner.html` | Planner: Notes, Schedule, Tables |

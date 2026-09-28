@@ -184,7 +184,7 @@ static void throttle(bool on)
     apply_clock();                    /* s_state already says which */
     wifi_mgr_power_save(on);
     ESP_LOGW(TAG, "%.1f C: %s", s_temp,
-             on ? "throttling (CPU 80 MHz, WiFi power save)" : "back to full speed");
+             on ? "throttling (CPU 80 MHz)" : "back to full speed");
 }
 
 /* --------------------------------------------------------------- cool-down */

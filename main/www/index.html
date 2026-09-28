@@ -74,6 +74,13 @@
   .bar i{display:block;height:100%;background:var(--accent);width:0}
   .empty{color:var(--muted);font-size:14px;padding:18px 4px;text-align:center}
   .hint{font-size:12px;color:var(--muted);margin-top:8px}
+  .deskrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+  .deskl{width:62px;font-size:13px;color:var(--muted)}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;flex-wrap:wrap}
+  .seg button{border:0;border-radius:0;font-size:13px;padding:6px 12px}
+  .seg button+button{border-left:1px solid var(--line)}
+  .seg button.on{background:var(--accent);color:#fff}
+  .seg button.pending{background:color-mix(in srgb,var(--accent) 30%,transparent)}
   /* One page, two views: / is Files, /system is System. */
   body[data-view="files"] .v-system, body[data-view="system"] .v-files{display:none!important}
   pre.log{margin:10px 0 0;padding:10px;background:var(--bg);color:var(--fg);
@@ -152,6 +159,23 @@
     </div>
     <div class="msg" id="keyMsg"></div>
     <div class="hint" id="linkInfo"></div>
+  </div>
+
+  <div class="card v-system">
+    <div class="row">
+      <strong class="grow">Desk-Disp</strong>
+      <span class="pill" id="deskSeen">–</span>
+    </div>
+    <div class="deskrow"><span class="deskl">Clock</span>
+      <div class="seg" id="dZone"><button data-v="ist">India</button><button data-v="nl">Netherlands</button></div></div>
+    <div class="deskrow"><span class="deskl">Screen</span>
+      <div class="seg" id="dView"><button data-v="clock">Clock</button><button data-v="sky">Sky view</button></div></div>
+    <div class="deskrow"><span class="deskl">OLED</span>
+      <div class="seg" id="dOled"><button data-v="auto">Follows the clock</button><button data-v="room">Room &amp; Nifty</button><button data-v="news">Headlines</button></div></div>
+    <div class="msg" id="deskMsg"></div>
+    <div class="hint">Reaches the desk within a few seconds. The BOOT button still works, and this
+      always shows what the desk is actually showing. A sky view opened from here stays
+      open until you close it. For the pomodoro, see Planner → Focus.</div>
   </div>
 
   <div class="card v-files" id="browser" style="display:none">
@@ -601,7 +625,7 @@ function renderThermal(s) {
     `Now ${fmtC(s.temp_c)}, peak since boot ${fmtC(s.temp_peak_c)}. ` +
     (s.cpu_mhz ? `CPU ${s.cpu_mhz} MHz; ${s.bursts} burst${s.bursts === 1 ? '' : 's'} to 240 MHz since boot ` +
                  `(for heavy work, up to 20 s at a time, only below 65 °C). ` : '') +
-    `At ${s.therm_warm_c} °C it throttles (CPU 80 MHz, WiFi power save) and stays online; ` +
+    `At ${s.therm_warm_c} °C it throttles (CPU 80 MHz) and stays online; ` +
     `at ${s.therm_hot_c} °C it unmounts the drives and sleeps until cool.`;
 
   // Shown once per page load, and kept (not auto-hidden): the box went
@@ -700,7 +724,48 @@ $('otaFile').onchange = async () => {
   xhr.send(f);
 };
 
+/* ---- Desk-Disp's modes ---------------------------------------------- */
+// What the desk reports is shown as selected; a choice just sent is shown
+// as pending until the desk reports it (or 12 s pass).
+const DESK = { dZone: 'zone', dView: 'view', dOled: 'oled' };
+let deskNow = null, deskPending = {};
+
+function deskRender() {
+  const seen = deskNow && deskNow.seen;
+  $('deskSeen').textContent = !seen ? 'not heard from'
+    : deskNow.age_s > 30 ? `last heard ${deskNow.age_s} s ago` : 'connected';
+  $('deskSeen').className = 'pill ' + (seen && deskNow.age_s <= 30 ? 'ok' : 'warm');
+  for (const [id, key] of Object.entries(DESK)) {
+    const p = deskPending[key];
+    if (p && (seen && deskNow[key] === p.v || Date.now() - p.t > 12000)) delete deskPending[key];
+    $(id).querySelectorAll('button').forEach(b => {
+      b.classList.toggle('on', !!seen && deskNow[key] === b.dataset.v && !deskPending[key]);
+      b.classList.toggle('pending', !!deskPending[key] && deskPending[key].v === b.dataset.v);
+    });
+  }
+}
+
+async function deskLoad() {
+  try { deskNow = await api('/api/desk'); deskRender(); } catch (e) { /* next tick */ }
+}
+
+for (const [id, key] of Object.entries(DESK)) {
+  $(id).querySelectorAll('button').forEach(b => b.onclick = async () => {
+    if (!(await ensureAuth())) { note($('deskMsg'), 'password required', 'err'); return; }
+    try {
+      await api('/api/desk', { method: 'POST', body: JSON.stringify({ [key]: b.dataset.v }) });
+      deskPending[key] = { v: b.dataset.v, t: Date.now() };
+      deskRender();
+      $('deskMsg').className = 'msg';
+    } catch (e) { note($('deskMsg'), e.message, 'err'); }
+  });
+}
+
 const SYSTEM_VIEW = document.body.dataset.view === 'system';
+if (SYSTEM_VIEW) {
+  deskLoad();
+  setInterval(() => { if (document.visibilityState === 'visible') deskLoad(); }, 3000);
+}
 status();
 crashCheck();
 if (SYSTEM_VIEW) pollLog();

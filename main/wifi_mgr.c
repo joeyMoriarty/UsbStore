@@ -183,6 +183,7 @@ esp_err_t wifi_mgr_start(void)
             s_station = true;
             netlog_set_network_ready(true);
             ESP_LOGI(TAG, "joined \"%s\" as %s", ssid, s_ip);
+            wifi_mgr_power_save(false);        /* reachable power saving: see there */
 
             /* Internet time, for timestamping climate readings. Runs in the
              * background and re-syncs by itself; readings are refused until
@@ -225,10 +226,26 @@ void wifi_mgr_pause(void)
 
 void wifi_mgr_power_save(bool on)
 {
-    /* MAX_MODEM sleeps the radio between beacons: slower to respond, but a
-     * real cut in radio-on time - which is the main heat source. MIN_MODEM
-     * is ESP-IDF's default. No effect in setup-AP mode. */
-    esp_wifi_set_ps(on ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM);
+    /*
+     * MIN_MODEM, always: the radio naps between the router's beacons but
+     * wakes for every DTIM beacon, so it still gets the router's buffered
+     * broadcasts - including a new device's "who has 192.168.50.194?" ARP,
+     * without which a phone can't reach the box at all.
+     *
+     * Two things are deliberately NOT used, because each left the box deaf
+     * to those broadcasts (phones couldn't connect; the PC, which already
+     * knew the box's address, carried on fine):
+     *  - an ESP-NOW wake window (esp_now_set_wake_window), whose schedule
+     *    competed with the DTIM wake-ups;
+     *  - MAX_MODEM when throttling, which sleeps through DTIM beacons.
+     * WIFI_PS_NONE also works, but keeps the radio on permanently: measured
+     * ~10 C hotter (65 C vs ~55 C), five degrees from the throttle point.
+     *
+     * So `on` (throttling) no longer changes the radio; the CPU clock drop is
+     * what cools a throttled box. No effect in setup-AP mode.
+     */
+    (void)on;
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
 }
 
 void wifi_mgr_status(char *out, size_t len)

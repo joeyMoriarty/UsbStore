@@ -30,6 +30,8 @@
 #include "planner.h"
 #include "devlink.h"
 #include "news.h"
+#include "pomodoro.h"
+#include "deskctl.h"
 
 static const char *TAG = "web";
 
@@ -1070,7 +1072,7 @@ esp_err_t web_server_start(void)
     }
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers  = 32;
+    cfg.max_uri_handlers  = 40;          /* 32 registered: the old limit exactly */
     cfg.stack_size        = 8192;
     cfg.lru_purge_enable  = true;
     /* Transfers now overlap with page traffic, so allow more connections.
@@ -1115,6 +1117,8 @@ esp_err_t web_server_start(void)
     climate_routes(srv);
     planner_routes(srv);
     news_routes(srv);
+    pomodoro_routes(srv);
+    deskctl_routes(srv);
 
     ESP_LOGI(TAG, "http server up on port 80");
     return ESP_OK;

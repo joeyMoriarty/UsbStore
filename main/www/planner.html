@@ -86,6 +86,19 @@
   table.grid th input{font-weight:600}
   table.grid td.x,table.grid th.x{min-width:32px;width:32px;text-align:center;background:var(--panel)}
   .dialog{border:1px solid var(--accent)}
+  .pomo{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}
+  @media (max-width:720px){ .pomo{grid-template-columns:1fr} }
+  .pomo-now{text-align:center}
+  .ring{width:100%;max-width:260px;display:block;margin:0 auto}
+  .ring-bg{fill:none;stroke:var(--soft);stroke-width:12}
+  .ring-fg{fill:none;stroke:var(--muted);stroke-width:12;stroke-linecap:round;
+           transform:rotate(-90deg);transform-origin:100px 100px;transition:stroke-dashoffset .4s linear}
+  .ring-fg.focus{stroke:#d9483b} .ring-fg.brk{stroke:#1e8e4f}
+  .ring-t{font-size:40px;font-weight:600;fill:var(--fg);font-variant-numeric:tabular-nums}
+  .ring-s{font-size:14px;fill:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+  .pomo-label{font-weight:500;min-height:1.5em;margin-top:6px}
+  .pomo-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+  @media (max-width:420px){ .pomo-grid{grid-template-columns:repeat(2,minmax(0,1fr))} }
 </style>
 </head>
 <body>
@@ -99,6 +112,7 @@
     <button data-t="notes" class="on">Notes</button>
     <button data-t="schedule">Schedule</button>
     <button data-t="tables">Tables</button>
+    <button data-t="focus">Focus</button>
   </div>
 
   <!-- ============================== NOTES ============================== -->
@@ -139,6 +153,47 @@
         <div id="tabList" style="margin-top:8px"></div>
       </div>
       <div class="card editor" id="tabEditor"></div>
+    </div>
+  </section>
+
+  <!-- ============================== FOCUS ============================== -->
+  <section id="tab-focus" hidden>
+    <div class="pomo">
+      <div class="card pomo-now">
+        <svg viewBox="0 0 200 200" class="ring">
+          <circle cx="100" cy="100" r="86" class="ring-bg"/>
+          <circle cx="100" cy="100" r="86" class="ring-fg" id="pRing"/>
+          <text x="100" y="92" text-anchor="middle" class="ring-t" id="pTime">--:--</text>
+          <text x="100" y="122" text-anchor="middle" class="ring-s" id="pPhase">not running</text>
+        </svg>
+        <div class="pomo-label" id="pLabel"></div>
+        <div class="row" style="justify-content:center;margin-top:10px">
+          <button class="primary" id="pStart">Start</button>
+          <button id="pPause" hidden>Pause</button>
+          <button id="pResume" class="primary" hidden>Resume</button>
+          <button id="pSkip" hidden>Skip</button>
+          <button id="pStop" class="danger" hidden>Stop</button>
+        </div>
+        <div class="small muted" id="pMsg" style="text-align:center;margin-top:8px"></div>
+      </div>
+      <div class="card">
+        <strong>Set up</strong>
+        <label>What you're working on (optional)</label>
+        <input id="pLabelIn" maxlength="39" placeholder="e.g. Chapter 3 draft">
+        <div class="pomo-grid">
+          <div><label>Focus, minutes</label><input id="pFocus" type="number" min="1" max="60" value="25"></div>
+          <div><label>Short break</label><input id="pShort" type="number" min="1" max="30" value="5"></div>
+          <div><label>Long break</label><input id="pLong" type="number" min="1" max="60" value="15"></div>
+          <div><label>Rounds</label><input id="pRounds" type="number" min="1" max="8" value="4"></div>
+        </div>
+        <label class="row" style="gap:6px;color:var(--fg);font-size:14px;margin-top:12px">
+          <input id="pAuto" type="checkbox" style="width:auto" checked> Start the next phase by itself
+        </label>
+        <div class="small muted" style="margin-top:10px">Start uses these settings. The box keeps
+          time, so closing this page doesn't stop it. Desk-Disp shows it on the clock: a coloured
+          rim from the minute hand to where it will be when the phase ends — red for focus, green
+          for a break — and the countdown on the strip underneath.</div>
+      </div>
     </div>
   </section>
 </div>
@@ -660,11 +715,92 @@ $('tabNew').onclick = () => {
   openTable(t.id);
 };
 
+/* =============================== focus ===================================
+ * The box runs the timer; this page shows it and sends Start / Pause / Resume
+ * / Skip / Stop. The countdown ticks locally from ends_at, corrected for any
+ * difference between this device's clock and the box's. */
+let pomo = null, clockSkew = 0;
+const PHASE = { focus: 'Focus', short: 'Short break', long: 'Long break', done: 'Done', idle: 'Not running' };
+const RING = 2 * Math.PI * 86;
+$('pRing').style.strokeDasharray = RING;
+
+function pomoFill(s) {
+  $('pFocus').value = s.focus; $('pShort').value = s.short; $('pLong').value = s.long;
+  $('pRounds').value = s.rounds; $('pAuto').checked = s.auto; $('pLabelIn').value = s.label;
+}
+
+function pomoRender() {
+  if (!pomo) return;
+  const st = pomo.state;
+  const running = ['focus', 'short', 'long'].includes(st.phase);
+  const now = Date.now() / 1000 + clockSkew;
+  const left = !running ? 0 : st.paused ? st.left_s : Math.max(0, st.ends_at - now);
+  const m = Math.floor(left / 60), sec = Math.floor(left % 60);
+  $('pTime').textContent = running ? `${pad2(m)}:${pad2(sec)}` : st.phase === 'done' ? '✓' : '--:--';
+  $('pPhase').textContent = running
+    ? `${PHASE[st.phase]} · ${st.round}/${st.rounds}${st.paused ? ' · paused' : ''}`
+    : st.phase === 'done' ? `${st.rounds} rounds done` : PHASE.idle;
+  $('pLabel').textContent = running || st.phase === 'done' ? st.label : '';
+  const frac = running && st.len_s ? left / st.len_s : 0;
+  const ring = $('pRing');
+  ring.style.strokeDashoffset = RING * (1 - frac);
+  ring.classList.toggle('focus', st.phase === 'focus');
+  ring.classList.toggle('brk', st.phase === 'short' || st.phase === 'long');
+  $('pStart').hidden = running;
+  $('pStart').textContent = st.phase === 'idle' ? 'Start' : 'Start again';
+  $('pPause').hidden = !running || st.paused;
+  $('pResume').hidden = !running || !st.paused;
+  $('pSkip').hidden = !running;
+  $('pStop').hidden = st.phase === 'idle';
+}
+
+function pomoTake(j) {
+  const first = !pomo;
+  pomo = j;
+  clockSkew = j.now - Date.now() / 1000;
+  if (first) pomoFill(j.settings);
+  $('pMsg').textContent = j.clock_ok ? '' : 'The box is still waiting for internet time.';
+  pomoRender();
+}
+
+async function pomoLoad() {
+  try {
+    const r = await fetch('/api/pomodoro', { cache: 'no-store' });
+    if (r.ok) pomoTake(await r.json());
+  } catch (e) { /* the next tick tries again */ }
+}
+
+async function pomoAct(action) {
+  const body = { action };
+  if (action === 'start') {
+    Object.assign(body, {
+      focus: +$('pFocus').value, short: +$('pShort').value, long: +$('pLong').value,
+      rounds: +$('pRounds').value, auto: $('pAuto').checked, label: $('pLabelIn').value.trim(),
+    });
+  }
+  try {
+    const r = await fetch('/api/pomodoro', { method: 'POST', body: JSON.stringify(body) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+    pomoTake(j);
+    $('pMsg').textContent = action === 'start' ? 'Started — Desk-Disp shows it within a few seconds.' : '';
+  } catch (e) { $('pMsg').textContent = e.message; }
+}
+
+$('pStart').onclick  = () => pomoAct('start');
+$('pPause').onclick  = () => pomoAct('pause');
+$('pResume').onclick = () => pomoAct('resume');
+$('pSkip').onclick   = () => pomoAct('skip');
+$('pStop').onclick   = () => { if (confirm('Stop the timer?')) pomoAct('stop'); };
+setInterval(pomoRender, 250);
+setInterval(() => { if (document.visibilityState === 'visible') pomoLoad(); }, 5000);
+
 /* ================================ tabs =================================== */
 $('tabs').querySelectorAll('button').forEach(b => b.onclick = () => {
   $('tabs').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
-  for (const t of ['notes', 'schedule', 'tables']) $('tab-' + t).hidden = t !== b.dataset.t;
+  for (const t of ['notes', 'schedule', 'tables', 'focus']) $('tab-' + t).hidden = t !== b.dataset.t;
   if (b.dataset.t === 'schedule') renderSchedule();
+  if (b.dataset.t === 'focus') pomoLoad();
   try { localStorage.setItem('plannerTab', b.dataset.t); } catch (e) {}
 });
 
@@ -673,6 +809,7 @@ $('tabs').querySelectorAll('button').forEach(b => b.onclick = () => {
     // One login prompt up front, rather than one per parallel request.
     const a = await fetch('/api/auth', { method: 'POST' });
     if (!a.ok) throw new Error('password required');
+    pomoLoad();                            // the timer needs no system drive
     await Promise.all(['notes', 'events', 'tables'].map(loadDoc));
   } catch (e) {
     say(e.message, true);

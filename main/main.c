@@ -26,6 +26,8 @@
 #include "climate.h"
 #include "devlink.h"
 #include "news.h"
+#include "pomodoro.h"
+#include "deskctl.h"
 
 static const char *TAG = "main";
 
@@ -67,6 +69,10 @@ void app_main(void)
 
     if (climate_start() != ESP_OK) {
         ESP_LOGE(TAG, "climate logger failed to start");
+    }
+    deskctl_start();
+    if (pomodoro_start() != ESP_OK) {
+        ESP_LOGE(TAG, "pomodoro failed to start");
     }
     if (news_start() != ESP_OK) {
         ESP_LOGE(TAG, "news cache failed to start");

@@ -19,6 +19,8 @@
 #include "auth.h"
 #include "climate.h"
 #include "news.h"
+#include "pomodoro.h"
+#include "deskctl.h"
 #include "sysdrive.h"
 #include "usb_storage.h"
 #include "web_server.h"
@@ -29,12 +31,16 @@ static const char *TAG = "devlink";
 /* ---- wire format: keep in step with Desk-Disp's include/UsbStoreLink.h ---- */
 
 #define DL_MAGIC  0x5355          /* "US" */
-#define DL_VER    3               /* 2: + sky, weather, forecast; 3: + bridge address */
-#define DL_HELLO  1               /* Desk-Disp -> UsbStore, broadcast */
+#define DL_VER    6               /* 2: + sky, weather, forecast; 3: + bridge address;
+                                     4: 60-byte titles; 5: + POLL / POMO;
+                                     6: + Desk-Disp's modes both ways */
+#define DL_HELLO  1               /* Desk-Disp -> UsbStore, broadcast, once a minute */
 #define DL_TASKS  2               /* UsbStore -> Desk-Disp, unicast reply */
+#define DL_POLL   3               /* Desk-Disp -> UsbStore, every few seconds */
+#define DL_POMO   4               /* UsbStore -> Desk-Disp: the pomodoro */
 #define DL_TAG    16              /* HMAC-SHA256, truncated */
-#define DL_ITEMS  4
-#define DL_TITLE  39
+#define DL_ITEMS  3               /* 3 x 71 B keeps TASKS under ESP-NOW's 250 B */
+#define DL_TITLE  60              /* the planner caps titles at 60 characters */
 
 typedef struct __attribute__((packed)) {
     uint16_t magic;
@@ -108,10 +114,37 @@ typedef struct __attribute__((packed)) {
     uint8_t   tag[DL_TAG];
 } dl_tasks_t;
 
+/* "What's the pomodoro doing?" - and here are my modes (DESK_* bits). */
+typedef struct __attribute__((packed)) {
+    dl_hdr_t h;
+    uint8_t  state;
+    uint8_t  tag[DL_TAG];
+} dl_poll_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t seq;                 /* bumps on every change */
+    uint8_t  phase;               /* pomo_phase_t */
+    uint8_t  paused;
+    uint8_t  round, rounds;
+    uint32_t ends_at;             /* epoch, while running */
+    uint32_t left_s;              /* while paused */
+    uint32_t len_s;               /* the whole phase */
+    char     label[40];           /* UTF-8, NUL-padded */
+} dl_pomo_t;
+
+typedef struct __attribute__((packed)) {
+    dl_hdr_t  h;
+    dl_pomo_t p;                  /* encrypted from here: the label may be private */
+    uint32_t  desk_seq;           /* the web app's latest request; 0 = none */
+    uint8_t   desk_bits;          /* ... to here */
+    uint8_t   tag[DL_TAG];
+} dl_pomo_msg_t;
+
 _Static_assert(sizeof(dl_sky_t) == 48 && sizeof(dl_wx_t) == 16 && sizeof(dl_fc_t) == 10,
                "sky/weather layout changed");
 _Static_assert(sizeof(dl_hello_t) == 134, "HELLO layout changed");
 _Static_assert(sizeof(dl_tasks_t) <= ESP_NOW_MAX_DATA_LEN, "TASKS too big for ESP-NOW v1");
+_Static_assert(sizeof(dl_poll_t) == 29 && sizeof(dl_pomo_msg_t) == 93, "POLL/POMO layout changed");
 
 #define ST_STORED   0x01          /* the reading was logged */
 #define ST_CLOCK    0x02          /* UsbStore's clock is set */
@@ -134,8 +167,12 @@ typedef struct {
 } up_t;
 
 typedef struct {
-    uint8_t    mac[6];
-    dl_hello_t pkt;
+    uint8_t mac[6];
+    uint8_t type;                 /* DL_HELLO or DL_POLL */
+    union {
+        dl_hello_t hello;
+        dl_poll_t  poll;
+    } u;
 } rx_t;
 
 static QueueHandle_t     s_rx;
@@ -440,17 +477,22 @@ static void ensure_loaded(void)
 
 /* ------------------------------------------------------------------ packets */
 
-static void send_to(const uint8_t mac[6], const dl_tasks_t *out)
+static void send_raw(const uint8_t mac[6], const void *data, size_t len)
 {
     if (!esp_now_is_peer_exist(mac)) {
         esp_now_peer_info_t peer = { .ifidx = WIFI_IF_STA, .channel = 0, .encrypt = false };
         memcpy(peer.peer_addr, mac, 6);
         esp_now_add_peer(&peer);
     }
-    esp_err_t err = esp_now_send(mac, (const uint8_t *)out, sizeof(*out));
+    esp_err_t err = esp_now_send(mac, (const uint8_t *)data, len);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "send: %s", esp_err_to_name(err));
     }
+}
+
+static void send_to(const uint8_t mac[6], const dl_tasks_t *out)
+{
+    send_raw(mac, out, sizeof(*out));
 }
 
 /* Unpack the fixed-point wire format into the climate log's floats. */
@@ -577,18 +619,73 @@ static void on_hello(const uint8_t mac[6], const dl_hello_t *in)
     send_to(mac, &out);
 }
 
+/*
+ * The pomodoro, for Desk-Disp's clock: asked for every few seconds, so a
+ * Start on the phone reaches the desk within moments. Answered only with a
+ * valid signature; the reply echoes the asker's nonce and is encrypted like
+ * the task list.
+ */
+static void on_poll(const uint8_t mac[6], const dl_poll_t *in)
+{
+    uint8_t km[32], ke[32], full[32];
+    if (!keys(km, ke)) {
+        return;
+    }
+    hmac(km, 32, in, offsetof(dl_poll_t, tag), NULL, 0, full);
+    if (!tag_ok(full, in->tag)) {
+        s_bad++;
+        return;
+    }
+    deskctl_reported(in->state);
+    uint32_t now = (uint32_t)time(NULL);
+    pomo_state_t st;
+    pomodoro_get(&st);
+    desk_want_t want = deskctl_wanted();
+
+    dl_pomo_msg_t out;
+    memset(&out, 0, sizeof(out));
+    out.h = (dl_hdr_t){ .magic = DL_MAGIC, .ver = DL_VER, .type = DL_POMO,
+                        .nonce = in->h.nonce, .epoch = now > CLOCK_VALID ? now : 0 };
+    out.p.seq     = st.seq;
+    out.p.phase   = (uint8_t)st.phase;
+    out.p.paused  = st.paused;
+    out.p.round   = st.round;
+    out.p.rounds  = st.rounds;
+    out.p.ends_at = st.ends_at;
+    out.p.left_s  = st.left_s;
+    out.p.len_s   = st.len_s;
+    memcpy(out.p.label, st.label, sizeof(out.p.label));
+    out.desk_seq  = want.seq;
+    out.desk_bits = want.bits;
+
+    keystream_xor(ke, &out.h, (uint8_t *)&out.p,
+                  offsetof(dl_pomo_msg_t, tag) - offsetof(dl_pomo_msg_t, p));
+    hmac(km, 32, &out, offsetof(dl_pomo_msg_t, tag), NULL, 0, full);
+    memcpy(out.tag, full, DL_TAG);
+    send_raw(mac, &out, sizeof(out));
+}
+
 /* WiFi task context: copy and hand over, nothing more. */
 static void on_recv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 {
-    if (len != sizeof(dl_hello_t)) {
+    dl_hdr_t h;
+    if (len < (int)sizeof(h)) {
+        return;
+    }
+    memcpy(&h, data, sizeof(h));
+    if (h.magic != DL_MAGIC || h.ver != DL_VER) {
         return;
     }
     rx_t rx;
-    memcpy(rx.mac, info->src_addr, 6);
-    memcpy(&rx.pkt, data, sizeof(rx.pkt));
-    if (rx.pkt.h.magic != DL_MAGIC || rx.pkt.h.ver != DL_VER || rx.pkt.h.type != DL_HELLO) {
+    if (h.type == DL_HELLO && len == sizeof(dl_hello_t)) {
+        memcpy(&rx.u.hello, data, sizeof(dl_hello_t));
+    } else if (h.type == DL_POLL && len == sizeof(dl_poll_t)) {
+        memcpy(&rx.u.poll, data, sizeof(dl_poll_t));
+    } else {
         return;
     }
+    rx.type = h.type;
+    memcpy(rx.mac, info->src_addr, 6);
     xQueueSend(s_rx, &rx, 0);
 }
 
@@ -597,8 +694,12 @@ static void devlink_task(void *arg)
     rx_t rx;
     for (;;) {
         if (xQueueReceive(s_rx, &rx, portMAX_DELAY) == pdTRUE) {
-            on_hello(rx.mac, &rx.pkt);
-            ensure_loaded();
+            if (rx.type == DL_POLL) {
+                on_poll(rx.mac, &rx.u.poll);
+            } else {
+                on_hello(rx.mac, &rx.u.hello);
+                ensure_loaded();
+            }
         }
     }
 }
@@ -621,11 +722,10 @@ esp_err_t devlink_start(void)
     if (err != ESP_OK) {
         return err;
     }
-    /* Left alone, ESP-NOW keeps the radio awake all the time - more heat
-     * for a board that already runs warm. Listening 25 ms in every 100 is
-     * plenty: Desk-Disp repeats its HELLO for a few seconds until answered. */
-    esp_wifi_connectionless_module_set_wake_interval(100);
-    esp_now_set_wake_window(25);
+    /* No ESP-NOW wake window: the WiFi radio is kept fully awake anyway (see
+     * wifi_mgr_power_save), and an earlier 25 ms-in-100 window left the box
+     * deaf to broadcast ARP - unreachable from any device that didn't already
+     * know its address. */
     esp_now_register_recv_cb(on_recv);
 
     if (xTaskCreatePinnedToCore(devlink_task, "devlink", 6144, NULL, 4, NULL, 1) != pdPASS) {

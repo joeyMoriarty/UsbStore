@@ -13,6 +13,8 @@ idf_component_register(
         "planner.c"
         "devlink.c"
         "news.c"
+        "pomodoro.c"
+        "deskctl.c"
     INCLUDE_DIRS "."
     EMBED_FILES
         "www/index.html"

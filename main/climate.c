@@ -57,8 +57,9 @@ typedef struct {
     sample_t   *ring;
     int         head, count;
     uint64_t    dropped;          /* oldest readings pushed out by a full ring */
-    sample_t    latest;
+    sample_t    latest;           /* the newest reading, stored or not */
     bool        have_latest;
+    uint32_t    last_stored;      /* when the newest *stored* one was taken */
 } series_t;
 
 enum { SER_ROOM, SER_OUTDOOR, SER_SKY, SER_N };
@@ -159,7 +160,12 @@ static bool push(series_t *s, uint32_t at, const float *v)
     memcpy(smp.v, v, sizeof(float) * s->nf);
     bool stored = false;
     portENTER_CRITICAL(&s_mux);
-    if (!s->have_latest || at >= s->latest.at + s->min_gap) {
+    /* The gap is measured from the last reading STORED. Measuring it from the
+     * last one received - as this once did - never lets a reading through
+     * when they arrive more often than min_gap: sky and weather come every
+     * minute against gaps of 2 and 5, and stopped being logged entirely
+     * whenever nothing happened to go missing. */
+    if (!s->last_stored || at >= s->last_stored + s->min_gap) {
         if (s->count == RING_MAX) {                /* drive missing for hours: */
             s->head = (s->head + 1) % RING_MAX;    /* drop the oldest */
             s->count--;
@@ -167,6 +173,7 @@ static bool push(series_t *s, uint32_t at, const float *v)
         }
         s->ring[(s->head + s->count) % RING_MAX] = smp;
         s->count++;
+        s->last_stored = at;
         stored = true;
     }
     s->latest      = smp;
